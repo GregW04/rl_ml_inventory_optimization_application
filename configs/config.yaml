@@ -1,0 +1,141 @@
+# RL-ML Inventory Optimization — central configuration
+
+project:
+  name: rl-ml-inventory-optimization
+  seed: 42
+  frequency: W  # weekly (ISO week, Monday-aligned in VN2 data)
+
+data:
+  data_dir: data
+  sales_file: Week8-2024-06-03-Sales.csv  # widest historical panel
+  instock_file: Week0-InStock.csv
+  master_file: Week0-Master.csv
+  initial_state_file: Week0-2024-04-08-Initial State.csv
+  id_cols:
+    - store
+    - product
+  date_col: date
+  target_col: sales
+  instock_col: in_stock
+
+forecasting:
+  forecaster_type: mean   # "quantile" (uncertainty) or "mean" (point forecast for RL)
+  features:
+    calendar:
+      enabled: true
+      cyclical_encoding: true
+    holidays:
+      enabled: true
+      events:
+        - new_year
+        - easter
+        - halloween
+        - black_friday
+        - christmas
+        - summer_peak
+      weeks_until_max: 4
+      weeks_since_max: 2
+    lags:
+      enabled: true
+      lags: [1, 2, 4, 8, 13, 26, 52]
+      rolling_windows: [4, 8, 13, 26, 52]
+      rolling_aggs: [mean, std, min, max, median]
+      expanding_aggs: [mean, std, min, max]
+      expanding_min_periods: 4
+    hierarchical:
+      enabled: true
+      group_levels:
+        - [store, product_group]
+        - [store, division]
+        - [store, department]
+        - [product_group]
+      group_lags: [1, 2, 4, 8, 26, 52]
+      group_rolling_windows: [4, 13, 52]
+      add_share_within_group: true
+
+  validation:
+    n_folds: 5
+    fold_size_weeks: 13
+    embargo_weeks: 52  # must be >= max(lags)
+    min_train_size_weeks: 52
+
+  model:
+    horizons: [0, 1, 2]
+    quantiles: [0.1, 0.5, 0.9]
+    sigma_divisor: 2.56  # normal approx: (Q90 - Q10) / 2.56 ≈ sigma
+    lightgbm:
+      num_leaves: 31
+      learning_rate: 0.05
+      n_estimators: 500
+      subsample: 0.8
+      colsample_bytree: 0.8
+      min_child_samples: 20
+      reg_alpha: 0.1
+      reg_lambda: 0.1
+      verbose: -1
+    categorical_features:
+      - store
+      - product
+      - product_group
+      - division
+      - department
+      - department_group
+      - store_format
+      - format
+
+  model_selection:
+    enabled: true
+    candidates: [lightgbm, xgboost, catboost]
+    n_candidates_to_tune: 1       # keep top-K after selection, tune all survivors
+    elimination_threshold: 0.40   # drop models >40% worse than best on defaults
+
+  tuning:
+    enabled: true
+    n_trials: 50
+    n_cv_folds: 5         # most-recent folds used per Optuna trial (1 = fast)
+    timeout_seconds: null # wall-clock cap in seconds (null = no cap)
+    seed: 42
+    n_trials_no_improve: 10      # stop if best hasn't improved for this many trials
+    early_stopping_min_delta: 0.0001
+
+  mlflow:
+    experiment_name: vn2-demand-forecasting
+    tracking_uri: sqlite:///mlruns.db
+    skip_duplicate_runs: true
+
+  artifacts:
+    model_dir: artifacts/models
+    forecasts_dir: artifacts/forecasts
+
+rl:
+  environment:
+    holding_cost: 0.2
+    shortage_cost: 1.0
+    lead_time_weeks: 2
+    lead_time_split: [0.5, 0.5]  # fraction arriving at t+1 and t+2
+    max_order: 50.0
+    simulation_weeks: 8  # use last N weeks of history for RL episodes
+    train_split_date: "2024-04-08"  # RL trains on weeks after this date
+
+  agents:
+    ppo:
+      policy: MlpPolicy
+      learning_rate: 0.0003
+      n_steps: 2048
+      batch_size: 64
+      n_epochs: 10
+      gamma: 0.99
+      total_timesteps: 500000
+
+    dqn:
+      order_buckets: [0, 1, 2, 3, 5, 7, 10, 15, 20, 30, 50]
+      learning_rate: 0.0001
+      buffer_size: 50000
+      learning_starts: 1000
+      batch_size: 64
+      gamma: 0.99
+      total_timesteps: 500000
+
+  mlflow:
+    experiment_name: vn2-inventory-rl
+    tracking_uri: sqlite:///mlruns.db

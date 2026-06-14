@@ -1,0 +1,30 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# MLflow
+mlruns.db
+mlruns/
+mlartifacts/
+.mlflow/
+
+# Generated artifacts (re-created by running the pipelines)
+artifacts/
+catboost_info/
+
+# Backups and temp
+._backup/
+
+# OS / editors
+.DS_Store
+**/.DS_Store
+.cursor/
+
+# Jupyter
+*.ipynb_checkpoints/
