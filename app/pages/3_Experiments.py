@@ -41,7 +41,7 @@ if "run_id" in overview:
     overview.insert(0, "run", overview["run_id"].str[:8])
     overview = overview.drop(columns=["run_id"])
 st.subheader(f"Runs ({len(runs)})")
-st.dataframe(overview, hide_index=True, use_container_width=True)
+st.dataframe(overview, hide_index=True, width="stretch")
 
 # ---- compare selected runs ----
 st.subheader("Compare runs")
@@ -62,7 +62,7 @@ if sel_ids:
     show_all = st.checkbox("Show identical fields too", value=False)
     if not show_all:
         comp = comp[comp.nunique(axis=1) > 1]
-    st.dataframe(comp, use_container_width=True)
+    st.dataframe(comp, width="stretch")
 
     if metric_cols:
         metric = st.selectbox("Bar-chart metric", metric_cols)
@@ -74,6 +74,16 @@ if sel_ids:
 st.subheader("Metric history (per-step)")
 hist_label = st.selectbox("Run", list(labels), key="hist_run")
 hist_run = labels[hist_label]
+
+if exps["forecasting"] == exp_label:
+    with st.expander("Period timeline (saved with run)"):
+        record = lib.run_setup(hist_run)
+        if record is None:
+            st.caption("No period setup was saved with this run.")
+        else:
+            lib.render_split_view(
+                pd.DataFrame(record.get("timeline") or []), record.get("resolved", {})
+            )
 step_metrics = [c.replace("metrics.", "") for c in metric_cols]
 metric_key = st.selectbox("Metric", step_metrics, key="hist_metric")
 if metric_key:

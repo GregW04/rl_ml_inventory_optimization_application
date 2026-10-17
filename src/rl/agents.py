@@ -27,6 +27,7 @@ def create_ppo_agent(
         batch_size=cfg.get("batch_size", 64),
         n_epochs=cfg.get("n_epochs", 10),
         gamma=cfg.get("gamma", 0.99),
+        ent_coef=cfg.get("ent_coef", 0.0),
         seed=seed,
         verbose=1,
     )
@@ -47,6 +48,10 @@ def create_dqn_agent(
         learning_starts=cfg.get("learning_starts", 1000),
         batch_size=cfg.get("batch_size", 64),
         gamma=cfg.get("gamma", 0.99),
+        # Slower epsilon decay + higher floor keeps the agent exploring larger orders
+        # for longer, countering the early collapse into under-ordering.
+        exploration_fraction=cfg.get("exploration_fraction", 0.1),
+        exploration_final_eps=cfg.get("exploration_final_eps", 0.05),
         seed=seed,
         verbose=1,
     )

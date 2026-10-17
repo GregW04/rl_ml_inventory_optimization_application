@@ -92,23 +92,33 @@ def add_calendar_features(
     out = df.copy()
     out[date_col] = pd.to_datetime(out[date_col])
 
-    dt = out[date_col]
-    out["week_of_year"] = dt.dt.isocalendar().week.astype(int)
-    out["month"] = dt.dt.month
-    out["quarter"] = dt.dt.quarter
-    out["year"] = dt.dt.year
-    out["week_of_month"] = ((dt.dt.day - 1) // 7 + 1).astype(int)
-    out["is_year_start"] = (out["week_of_year"] <= 2).astype(int)
-    out["is_year_end"] = (out["week_of_year"] >= 52).astype(int)
-
     feat_cfg = (config or {}).get("forecasting", {}).get("features", {})
     cal_cfg = feat_cfg.get("calendar", {})
     hol_cfg = feat_cfg.get("holidays", {})
 
-    if cal_cfg.get("cyclical_encoding", True):
-        for col, period in [("week_of_year", 52), ("month", 12)]:
-            out[f"{col}_sin"] = np.sin(2 * np.pi * out[col] / period)
-            out[f"{col}_cos"] = np.cos(2 * np.pi * out[col] / period)
+    if cal_cfg.get("enabled", True):
+        dt = out[date_col]
+        out["week_of_year"] = dt.dt.isocalendar().week.astype(int)
+        out["month"] = dt.dt.month
+        out["quarter"] = dt.dt.quarter
+        out["year"] = dt.dt.year
+        out["week_of_month"] = ((dt.dt.day - 1) // 7 + 1).astype(int)
+        out["is_year_start"] = (out["week_of_year"] <= 2).astype(int)
+        out["is_year_end"] = (out["week_of_year"] >= 52).astype(int)
+
+    if cal_cfg.get("enabled", True) and cal_cfg.get("cyclical_encoding", True):
+        # Harmonic 1 keeps the original column names. Higher harmonics can
+        # represent a sharp seasonal peak that a single sine cannot.
+        week = out["week_of_year"].to_numpy(dtype=float)
+        n_harmonics = int(cal_cfg.get("fourier_harmonics", 3))
+        for k_harm in range(1, max(n_harmonics, 1) + 1):
+            suffix = "" if k_harm == 1 else f"_{k_harm}"
+            angle = 2 * np.pi * k_harm * week / 52
+            out[f"week_of_year_sin{suffix}"] = np.sin(angle)
+            out[f"week_of_year_cos{suffix}"] = np.cos(angle)
+        month = out["month"].to_numpy(dtype=float)
+        out["month_sin"] = np.sin(2 * np.pi * month / 12)
+        out["month_cos"] = np.cos(2 * np.pi * month / 12)
 
     if not hol_cfg.get("enabled", True):
         return out

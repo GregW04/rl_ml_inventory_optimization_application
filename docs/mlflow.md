@@ -44,13 +44,16 @@ mlflow ui --backend-store-uri sqlite:///mlruns.db
 - **Metrics**: `cv_{mae,smape,mase,wql}_mean`, per-horizon `cv_*_h{0,1,2}_mean`, per-fold
   step metrics (`mae_h0`, …), full-data `train_*_h{h}`, model-selection / tuning scores.
 - **Artifacts**: `feature_importance/` (CSV + chart), `cv_charts/` (CV MAE, OOF sample),
-  `cv_detail/` (per-fold CSV), the saved forecaster `.joblib`, and `cv_metrics.json`.
+  `cv_detail/` (per-fold CSV), the saved forecaster `.joblib`, `cv_metrics.json`, and
+  `forecasts/`: `forecast_setup.json` (periods + timeline), `train_forecasts.parquet`
+  (out-of-sample forecasts for the RL blocks) and `oof_forecasts.parquet`. RL training and
+  evaluation read `forecasts/` of the run they are given.
 - **Tag**: `config_hash` — a hash of the forecasting config used by the duplicate-run guard.
 
 ### `vn2-inventory-rl` (one run per agent training)
 
 - **Params**: `agent`, cost/lead-time settings, `total_timesteps`, `n_skus`, learning rate,
-  and DQN `order_buckets` / `buffer_size`.
+  DQN `order_buckets` / `buffer_size`, `forecast_run_id` and the RL block dates it used.
 - **Metrics**: per-episode `ep_reward_mean`, `fill_rate_mean`, `shortage_rate_mean`,
   `avg_leftover_mean` (step = episode), plus `final_*` summaries.
 - **Artifacts**: `rl_charts/` (reward + fill-rate curves) and the saved agent `.zip`.
@@ -59,8 +62,8 @@ mlflow ui --backend-store-uri sqlite:///mlruns.db
 
 When `skip_duplicate_runs: true`, the forecasting pipeline hashes the forecasting config
 (excluding `mlflow`/`artifacts` paths) via `tracking.config_hash` and refuses to start if a
-**FINISHED** run with the same hash already exists. Override with `--force` (CLI) or the
-"Force re-run" checkbox in the app.
+**FINISHED** run with the same hash already exists. Override with `--force` (CLI); runs
+launched from the app always pass it.
 
 ## `tracking.py` API
 
@@ -76,5 +79,5 @@ When `skip_duplicate_runs: true`, the forecasting pipeline hashes the forecastin
 - `list_experiments()` → dataframe of experiments.
 - `search_runs(experiment_name, ...)` → dataframe of runs (params + metrics).
 - `get_metric_history(run_id, key)` → per-step series for a metric.
-- `list_artifacts(run_id, path)` / `download_artifact(run_id, artifact_path)`.
+- `list_artifacts(run_id, path)` / `download_artifact(run_id, artifact_path, dst_path=None)`.
 - `best_run(experiment_name, metric, mode)` → best run row by a metric.

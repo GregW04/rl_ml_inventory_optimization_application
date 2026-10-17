@@ -24,7 +24,7 @@ st.title("📈 Forecasts")
 lib.init_tracking()
 path = lib.forecasts_path()
 if not path.exists():
-    st.info("No forecasts yet. Run the forecasting pipeline from **Run Pipelines**.")
+    st.info("No forecasts yet. Run the forecasting pipeline from **Run Forecasting**.")
     st.stop()
 
 
@@ -61,7 +61,7 @@ st.pyplot(fig)
 
 with st.expander("Forecast table"):
     cols = [c for c in sku.columns if c in ("date", "sales") or c.startswith(("mu_h", "sigma_h", "pred_q"))]
-    st.dataframe(sku[cols], hide_index=True, use_container_width=True)
+    st.dataframe(sku[cols], hide_index=True, width="stretch")
 
 # ---- feature importance from the latest forecasting run ----
 st.subheader("Feature importance (latest run)")
@@ -79,7 +79,7 @@ else:
         try:
             if not png.empty:
                 local = tracking.download_artifact(run_id, png.iloc[0]["path"])
-                st.image(local, use_container_width=True)
+                st.image(local, width="stretch")
             elif not csv.empty:
                 local = tracking.download_artifact(run_id, csv.iloc[0]["path"])
                 imp = pd.read_csv(local)

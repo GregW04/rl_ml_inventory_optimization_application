@@ -23,7 +23,7 @@ src/forecasting/         # preprocessing, features, validation, model, pipeline
 src/simulation/          # Gymnasium env + reward
 src/rl/                  # PPO / DQN agents + training
 src/utils/               # metrics, config, and tracking.py (all MLflow access)
-app/                     # Streamlit frontend (Home + 4 pages)
+app/                     # Streamlit frontend (Home + 5 pages)
 notebooks/               # EDA and pipeline demos
 docs/mlflow.md           # MLflow + tracking-utility guide
 data/                    # VN2 competition CSVs
@@ -41,15 +41,22 @@ One UI to **trigger runs**, **browse & compare** MLflow runs, view **forecasts**
 vs predicted, Q10–Q90 intervals, feature importance), and inspect **inventory/RL** results
 (training curves, fill-rate KPIs, per-SKU order recommendations).
 
+**Run Forecasting** sets periods and features and launches a forecasting run. **Run RL**
+picks a finished forecasting run, shows the split it used, and trains / evaluates agents on
+it. Runs execute in the background (logs in `artifacts/app_jobs/`), so you can switch pages
+while they work.
+
 ### Option B — the CLI
 
 ```bash
 # Demand forecasting
 python -m src.forecasting.pipeline --config configs/config.yaml
 
-# RL training
+# RL training on the latest forecasting run (its periods + forecasts),
+# or on a specific one with --forecast-run <run_id>
 python -m src.rl.train --config configs/config.yaml --agent ppo
-python -m src.rl.train --config configs/config.yaml --agent dqn
+python -m src.rl.train --config configs/config.yaml --agent dqn --forecast-run <run_id>
+python -m src.rl.evaluate --config configs/config.yaml --forecast-run <run_id>
 ```
 
 ## MLflow
@@ -77,7 +84,8 @@ Experiments: `vn2-demand-forecasting` and `vn2-inventory-rl`. See
 
 - **Frequency**: weekly (ISO week starts, Mondays in the data)
 - **OOS masking**: `InStock=False` → `sales=NaN` (censored demand)
-- **Validation**: expanding windows with embargo = `max(lag_features)` weeks
+- **Periods**: configure train / validation / test RL blocks and forecaster CV in the app; forecasts are fit out-of-sample per block (see `forecast_setup.json`)
+- **Validation**: expanding-window CV. Before each scored block the training fit stops for an embargo equal to the forecast horizon, so a training label cannot reach into the scored weeks. Backward lags (including 51–53) use earlier sales only and do not widen that embargo. Lag and rolling features use sales through *t−1*; seasonal lags use *t−51* through *t−53*.
 - **Forecasts**: Q10/Q50/Q90 per horizon h ∈ {0, 1, 2} → μ = Q50, σ ≈ (Q90−Q10)/2.56
 - **RL reward**: `R_t = −0.2·leftover_t − 1.0·shortage_t`
 

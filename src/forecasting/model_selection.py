@@ -20,10 +20,7 @@ import pandas as pd
 
 from src.forecasting.model import get_feature_columns, get_forecaster_class, get_primary_metric
 from src.forecasting.registry import available_candidates
-from src.forecasting.validation import (
-    generate_expanding_folds,
-    get_unique_dates,
-)
+from src.forecasting.validation import get_unique_dates, make_folds
 
 logger = logging.getLogger(__name__)
 
@@ -84,15 +81,8 @@ def select_candidates(
 
     logger.info("Model selection — evaluating: %s (metric=%s)", importable, primary)
 
-    val_cfg = config["forecasting"]["validation"]
     dates = get_unique_dates(df)
-    folds = generate_expanding_folds(
-        dates,
-        n_folds=val_cfg["n_folds"],
-        fold_size_weeks=val_cfg["fold_size_weeks"],
-        embargo_weeks=val_cfg["embargo_weeks"],
-        min_train_size_weeks=val_cfg["min_train_size_weeks"],
-    )
+    folds = make_folds(dates, config)
     if not folds:
         raise RuntimeError("No CV folds generated; cannot run model selection.")
 

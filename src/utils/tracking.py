@@ -168,6 +168,8 @@ def get_metric_history(run_id: str, key: str) -> pd.DataFrame:
     client = MlflowClient()
     history = client.get_metric_history(run_id, key)
     rows = [{"step": m.step, "value": m.value, "timestamp": m.timestamp} for m in history]
+    if not rows:
+        return pd.DataFrame(columns=["step", "value", "timestamp"])
     return pd.DataFrame(rows).sort_values("step").reset_index(drop=True)
 
 
@@ -181,10 +183,10 @@ def list_artifacts(run_id: str, path: str = "") -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def download_artifact(run_id: str, artifact_path: str) -> str:
-    """Download a run artifact to a local cache path and return that path."""
+def download_artifact(run_id: str, artifact_path: str, dst_path: str | None = None) -> str:
+    """Download a run artifact (to ``dst_path`` or a temp cache) and return its local path."""
     return mlflow.artifacts.download_artifacts(
-        run_id=run_id, artifact_path=artifact_path
+        run_id=run_id, artifact_path=artifact_path, dst_path=dst_path
     )
 
 

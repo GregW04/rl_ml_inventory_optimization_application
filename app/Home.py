@@ -33,13 +33,13 @@ st.code(uri, language="text")
 
 experiments = tracking.list_experiments()
 if experiments.empty:
-    st.info("No MLflow experiments yet. Use **Run Pipelines** to create the first run.")
+    st.info("No MLflow experiments yet. Use **Run Forecasting** to create the first run.")
 else:
     rows = []
     for _, e in experiments.iterrows():
         runs = tracking.search_runs(e["name"])
         rows.append({"experiment": e["name"], "runs": 0 if runs.empty else len(runs)})
-    st.dataframe(rows, hide_index=True, use_container_width=True)
+    st.dataframe(rows, hide_index=True, width="stretch")
 
 st.subheader("Latest champions")
 col1, col2 = st.columns(2)
@@ -71,8 +71,9 @@ with col2:
 st.divider()
 st.markdown(
     "Use the pages in the sidebar:\n"
-    "1. **Run Pipelines** — launch forecasting / RL training with config overrides\n"
-    "2. **Experiments** — browse & compare MLflow runs\n"
-    "3. **Forecasts** — actual vs predicted, prediction intervals, feature importance\n"
-    "4. **Inventory & RL** — training curves, fill-rate KPIs, order recommendations"
+    "1. **Run Forecasting** — set periods & features, preview the timeline, launch forecasting\n"
+    "2. **Run RL** — pick a forecasting run, see its frozen split, train / evaluate agents\n"
+    "3. **Experiments** — browse & compare MLflow runs\n"
+    "4. **Forecasts** — actual vs predicted, prediction intervals, feature importance\n"
+    "5. **Inventory & RL** — training curves, fill-rate KPIs, order recommendations"
 )

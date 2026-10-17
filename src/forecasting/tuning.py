@@ -19,7 +19,7 @@ from src.forecasting.model import (
     get_primary_metric,
 )
 from src.forecasting.registry import get_spec, sample_params
-from src.forecasting.validation import generate_expanding_folds, get_unique_dates
+from src.forecasting.validation import get_unique_dates, make_folds
 
 logger = logging.getLogger(__name__)
 
@@ -114,21 +114,15 @@ def tune_model(
     primary = get_primary_metric(config)
     tune_cfg = config.get("forecasting", {}).get("tuning", {})
     n_trials = tune_cfg.get("n_trials", n_trials)
+    n_jobs = int(tune_cfg.get("n_jobs", 1) or 1)
     seed = tune_cfg.get("seed", seed)
     timeout = tune_cfg.get("timeout_seconds", timeout)
     n_cv_folds_tune = tune_cfg.get("n_cv_folds", 1)
     n_trials_no_improve = tune_cfg.get("n_trials_no_improve")
     early_stopping_min_delta = tune_cfg.get("early_stopping_min_delta", 0.0001)
 
-    val_cfg = config["forecasting"]["validation"]
     dates = get_unique_dates(df)
-    folds = generate_expanding_folds(
-        dates,
-        n_folds=val_cfg["n_folds"],
-        fold_size_weeks=val_cfg["fold_size_weeks"],
-        embargo_weeks=val_cfg["embargo_weeks"],
-        min_train_size_weeks=val_cfg["min_train_size_weeks"],
-    )
+    folds = make_folds(dates, config)
     if not folds:
         raise RuntimeError("No CV folds generated; cannot run hyperparameter tuning.")
 
@@ -168,17 +162,19 @@ def tune_model(
         )
 
     logger.info(
-        "Tuning %-12s — %d trials, %d fold(s), metric=%s ...",
+        "Tuning %-12s — %d trials, %d fold(s), n_jobs=%d, metric=%s ...",
         model_name,
         n_trials,
         n_cv_folds_tune,
+        n_jobs,
         primary,
     )
     study.optimize(
         objective,
         n_trials=n_trials,
+        n_jobs=n_jobs,
         timeout=timeout,
-        show_progress_bar=True,
+        show_progress_bar=n_jobs == 1,
         callbacks=callbacks or None,
     )
 

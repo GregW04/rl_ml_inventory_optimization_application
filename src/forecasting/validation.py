@@ -32,17 +32,21 @@ def generate_expanding_folds(
     dates: np.ndarray,
     n_folds: int = 5,
     fold_size_weeks: int = 13,
-    embargo_weeks: int = 52,
+    embargo_weeks: int = 2,
     min_train_size_weeks: int = 52,
+    gap_weeks: int | None = None,
 ) -> list[TimeSeriesFold]:
     """
-    Build expanding-window folds with embargo gap after train end.
+    Build expanding-window folds with an embargo after train end.
 
     Fold k:
-      Train:      dates[0 : train_end_idx]
-      Embargo:    next `embargo_weeks` dates (excluded from train features leakage)
+      Train:      dates up to the embargo
+      Embargo:    next `gap_weeks` dates, left out of the fit (the forecast horizon;
+                  labels reach forward across this hole)
       Validation: next `fold_size_weeks` dates
     """
+    if gap_weeks is not None:
+        embargo_weeks = gap_weeks
     dates = np.sort(dates)
     n = len(dates)
     folds: list[TimeSeriesFold] = []
@@ -97,15 +101,15 @@ def iter_fold_masks(
         yield fold, train_mask, val_mask
 
 
-def max_lag_from_config(config: dict) -> int:
-    """Infer maximum lag for embargo sanity check."""
-    lags = config.get("forecasting", {}).get("features", {}).get("lags", {}).get(
-        "lags", [52]
+def make_folds(dates: np.ndarray, config: dict) -> list[TimeSeriesFold]:
+    """Expanding CV folds on ``dates`` using the forecast-horizon embargo."""
+    from src.forecasting.periods import required_gap
+
+    val_cfg = config["forecasting"]["validation"]
+    return generate_expanding_folds(
+        dates,
+        n_folds=val_cfg["n_folds"],
+        fold_size_weeks=val_cfg["fold_size_weeks"],
+        gap_weeks=required_gap(config),
+        min_train_size_weeks=val_cfg["min_train_size_weeks"],
     )
-    group_lags = (
-        config.get("forecasting", {})
-        .get("features", {})
-        .get("hierarchical", {})
-        .get("group_lags", [52])
-    )
-    return max(max(lags), max(group_lags))

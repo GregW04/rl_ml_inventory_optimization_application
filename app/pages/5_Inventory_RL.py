@@ -30,7 +30,7 @@ rl_exp = lib.experiment_names()["rl"]
 # ---------------------------------------------------------------------------
 runs = lib.cached_runs(rl_exp)
 if runs.empty:
-    st.info("No RL runs yet. Train an agent from **Run Pipelines**.")
+    st.info("No RL runs yet. Train an agent from **Run RL**.")
     st.stop()
 
 labels = {
@@ -66,9 +66,15 @@ if not model_path.exists():
 
 
 @st.cache_resource
-def _load_rl_data():
-    from src.rl.train import prepare_rl_data
-    return prepare_rl_data(cfg)
+def _load_rl_data(forecast_run_id: str | None):
+    from src.rl.train import prepare_block
+
+    run_cfg = {**cfg, "rl": {**cfg["rl"], "forecast_run_id": forecast_run_id}}
+    try:
+        return prepare_block(run_cfg, "rl_test")
+    except RuntimeError as exc:
+        st.warning(str(exc))
+        return {}, {}, {}
 
 
 @st.cache_resource
@@ -77,10 +83,24 @@ def _load_agent(agent: str, path: str, mtime: float):
     return (DQN if agent == "dqn" else PPO).load(path)
 
 
-episodes, lookup = _load_rl_data()
+trained_on = lib.agent_meta(agent_type).get("forecast_run_id")
+st.caption(
+    f"RL test block of forecasting run `{trained_on[:8]}`, the run this agent was trained on."
+    if trained_on
+    else "This agent has no record of its forecasting run; using the latest run on disk."
+)
+episodes, lookup, order_caps = _load_rl_data(trained_on)
+if not episodes:
+    st.stop()
 agent = _load_agent(agent_type, str(model_path), model_path.stat().st_mtime)
-buckets = cfg["rl"]["agents"]["dqn"]["order_buckets"] if agent_type == "dqn" else None
 env_cfg = cfg["rl"]["environment"]
+normalize_action = bool(env_cfg.get("normalize_action", False))
+residual_mode = bool(env_cfg.get("residual_mode", False))
+scale_obs_by_cap = bool(env_cfg.get("scale_obs_by_cap", False))
+_dqn = cfg["rl"]["agents"]["dqn"]
+buckets = None
+if agent_type == "dqn":
+    buckets = _dqn["residual_buckets"] if residual_mode else _dqn["order_buckets"]
 
 
 def _recommend(store: int, product: int) -> dict:
@@ -90,19 +110,27 @@ def _recommend(store: int, product: int) -> dict:
         forecast_lookup=lookup,
         holding_cost=env_cfg["holding_cost"],
         shortage_cost=env_cfg["shortage_cost"],
-        lead_time_split=env_cfg["lead_time_split"],
+        lead_time_weeks=env_cfg["lead_time_weeks"],
         max_order=env_cfg["max_order"],
+        order_cap=order_caps.get((store, product)),
+        normalize_action=normalize_action,
+        residual_mode=residual_mode,
+        residual_floor_frac=env_cfg.get("residual_floor_frac", 0.25),
         discrete_buckets=buckets,
+        scale_obs_by_cap=scale_obs_by_cap,
     )
-    obs, _ = env.reset()
+    obs, info = env.reset()
     action, _ = agent.predict(obs, deterministic=True)
     order = env._resolve_order(action)
+    # The agent sees cap-units; the page shows physical units.
+    unit = float(info.get("obs_scale", 1.0))
     return {
-        "on_hand": float(obs[0]),
-        "in_transit_1w": float(obs[1]),
-        "in_transit_2w": float(obs[2]),
-        "mu_h0": float(obs[3]),
-        "sigma_h0": float(obs[4]),
+        "on_hand": float(obs[0]) * unit,
+        "in_transit_1w": float(obs[1]) * unit,
+        "in_transit_2w": float(obs[2]) * unit,
+        "q10_h0": float(obs[3]) * unit,
+        "q50_h0": float(obs[4]) * unit,
+        "q90_h0": float(obs[5]) * unit,
         "recommended_order": round(order, 2),
     }
 
@@ -122,4 +150,4 @@ else:
     for store, product in sku_keys[:25]:
         r = _recommend(store, product)
         rows.append({"store": store, "product": product, **r})
-    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")

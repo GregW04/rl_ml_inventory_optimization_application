@@ -13,6 +13,8 @@ import matplotlib.pyplot as plt
 import mlflow
 import numpy as np
 import pandas as pd
+from mlflow.exceptions import MlflowException
+from mlflow.tracking import MlflowClient
 
 from src.forecasting.model import (
     build_feature_matrix,
@@ -21,8 +23,16 @@ from src.forecasting.model import (
     get_forecaster_type,
     get_primary_metric,
 )
+from src.forecasting.entity_metrics import log_cv_entity_metrics
+from src.forecasting.periods import (
+    build_setup_record,
+    load_setup,
+    resolve_periods,
+    save_setup,
+    setup_path,
+)
 from src.forecasting.preprocessing import load_panel_from_config
-from src.forecasting.validation import generate_expanding_folds, get_unique_dates, iter_fold_masks, max_lag_from_config
+from src.forecasting.validation import TimeSeriesFold, get_unique_dates, iter_fold_masks, make_folds
 from src.utils import tracking
 from src.utils.config import load_config
 
@@ -32,17 +42,11 @@ def run_cross_validation(
     config: dict,
     model_name: str = "lightgbm",
     model_params: dict | None = None,
+    folds: list[TimeSeriesFold] | None = None,
 ) -> tuple[pd.DataFrame, dict, list[dict]]:
     """Run expanding-window CV; return OOF predictions, summary metrics, and per-fold details."""
-    val_cfg = config["forecasting"]["validation"]
-    dates = get_unique_dates(df)
-    folds = generate_expanding_folds(
-        dates,
-        n_folds=val_cfg["n_folds"],
-        fold_size_weeks=val_cfg["fold_size_weeks"],
-        embargo_weeks=val_cfg["embargo_weeks"],
-        min_train_size_weeks=val_cfg["min_train_size_weeks"],
-    )
+    if folds is None:
+        folds = make_folds(get_unique_dates(df), config)
 
     feature_cols = get_feature_columns(df)
     ForecasterClass = get_forecaster_class(config)
@@ -69,6 +73,15 @@ def run_cross_validation(
             m["val_end"] = str(fold.val_end.date())
             fold_metrics.append(m)
 
+        if getattr(forecaster, "ltd_enabled", False):
+            m_ltd = forecaster.evaluate_ltd(scored)
+            if m_ltd:
+                m_ltd["fold_id"] = fold.fold_id
+                m_ltd["train_end"] = str(fold.train_end.date())
+                m_ltd["val_start"] = str(fold.val_start.date())
+                m_ltd["val_end"] = str(fold.val_end.date())
+                fold_metrics.append(m_ltd)
+
     oof = pd.concat(oof_parts, ignore_index=True) if oof_parts else pd.DataFrame()
 
     metrics_summary = {}
@@ -85,6 +98,15 @@ def run_cross_validation(
                 if metric in hdf.columns:
                     metrics_summary[f"cv_{metric}_h{h}_mean"] = float(hdf[metric].mean())
 
+        ltd_rows = [m for m in fold_metrics if m.get("target") == "S"]
+        if ltd_rows:
+            ldf = pd.DataFrame(ltd_rows)
+            for metric in ["mae", "mase", "wql"]:
+                if metric in ldf.columns:
+                    metrics_summary[f"cv_{metric}_S_mean"] = float(ldf[metric].mean())
+            if "picp_q83_S" in ldf.columns:
+                metrics_summary["cv_picp_q83_S_mean"] = float(ldf["picp_q83_S"].mean())
+
     return oof, metrics_summary, fold_metrics
 
 
@@ -94,8 +116,17 @@ def _log_fold_metrics(fold_metrics: list[dict]) -> None:
     if mdf.empty:
         return
     for _, row in mdf.iterrows():
-        h = int(row.get("horizon", 0))
         fold = int(row.get("fold_id", 0))
+        if row.get("target") == "S":
+            for metric in ["mae", "smape", "mase", "wql", "picp_q83_S"]:
+                val = row.get(metric)
+                if val is not None and np.isfinite(float(val)):
+                    mlflow.log_metric(f"{metric}_S", float(val), step=fold)
+            continue
+        horizon = row.get("horizon")
+        if horizon is None or not np.isfinite(float(horizon)):
+            continue
+        h = int(horizon)
         for metric in ["mae", "smape", "mase", "wql"]:
             val = row.get(metric)
             if val is not None and np.isfinite(float(val)):
@@ -226,6 +257,76 @@ def _run_tuning(
     return champion
 
 
+def _fit_rl_block_forecasts(
+    df: pd.DataFrame,
+    config: dict,
+    periods,
+    ForecasterClass: type,
+    model_name: str,
+    model_params: dict | None,
+) -> tuple[pd.DataFrame, dict[str, float], Any]:
+    """Out-of-sample forecasts for each RL block (per-block refit when enabled)."""
+    horizons = config["forecasting"]["model"]["horizons"]
+    feature_cols = get_feature_columns(df)
+    blocks = [
+        ("rl_train", periods.rl_train_start, periods.rl_train_end, periods.fit_end_rl_train),
+        ("rl_val", periods.rl_val_start, periods.rl_val_end, periods.fit_end_rl_val),
+        ("rl_test", periods.rl_test_start, periods.rl_test_end, periods.fit_end_rl_test),
+    ]
+    if not periods.refit_per_block:
+        fit_one = periods.fit_end_rl_train
+        blocks = [(n, s, e, fit_one) for n, s, e, _ in blocks]
+
+    parts: list[pd.DataFrame] = []
+    block_metrics: dict[str, float] = {}
+    last_forecaster = None
+
+    for name, start, end, fit_end in blocks:
+        train_df = df[df["date"] <= fit_end].copy()
+        pred_df = df[(df["date"] >= start) & (df["date"] <= end)].copy()
+        if pred_df.empty:
+            continue
+        forecaster = ForecasterClass(
+            config, model_name=model_name, model_params=model_params
+        )
+        forecaster.fit(train_df, feature_cols=feature_cols)
+        scored = forecaster.predict(pred_df, feature_cols=feature_cols)
+        parts.append(scored)
+        last_forecaster = forecaster
+
+        for h in horizons:
+            m = forecaster.evaluate_horizon(scored, horizon=h)
+            for k, v in m.items():
+                if isinstance(v, (int, float)) and np.isfinite(float(v)):
+                    block_metrics[f"oos_{name}_{k}_h{h}"] = float(v)
+        if getattr(forecaster, "ltd_enabled", False):
+            m_ltd = forecaster.evaluate_ltd(scored)
+            for k, v in (m_ltd or {}).items():
+                if isinstance(v, (int, float)) and np.isfinite(float(v)):
+                    block_metrics[f"oos_{name}_{k}"] = float(v)
+
+    if not parts:
+        return pd.DataFrame(), block_metrics, last_forecaster
+    combined = pd.concat(parts, ignore_index=True)
+    combined = combined.drop_duplicates(subset=["store", "product", "date"], keep="last")
+    return combined, block_metrics, last_forecaster
+
+
+def _keep_previous_forecasts(config: dict) -> None:
+    """Attach the on-disk forecasts to the run that wrote them if that run never logged them."""
+    prev_id = (load_setup(config) or {}).get("run_id")
+    path = setup_path(config).with_name("train_forecasts.parquet")
+    if not prev_id or not path.exists():
+        return
+    client = MlflowClient()
+    try:
+        logged = {a.path for a in client.list_artifacts(prev_id, "forecasts")}
+        if "forecasts/train_forecasts.parquet" not in logged:
+            client.log_artifact(prev_id, str(path), artifact_path="forecasts")
+    except MlflowException:  # run is in another tracking store
+        pass
+
+
 def run_pipeline(config_path: str | None = None, force: bool = False) -> dict:
     """Full pipeline: load → features → CV → retrain → save artifacts."""
     config = load_config(config_path)
@@ -234,19 +335,31 @@ def run_pipeline(config_path: str | None = None, force: bool = False) -> dict:
     mlflow_cfg = config["forecasting"]["mlflow"]
     experiment_name = tracking.setup_mlflow(config, "forecasting")
 
-    config_hash = tracking.config_hash(
-        config["forecasting"], ignore_keys=("mlflow", "artifacts")
-    )
+    hash_payload = {
+        "forecasting": {
+            k: v
+            for k, v in config["forecasting"].items()
+            if k not in ("mlflow", "artifacts")
+        },
+        "periods": config.get("periods"),
+        "data": {
+            k: config.get("data", {}).get(k)
+            for k in ("sales_file", "initial_state_date")
+        },
+    }
+    config_hash = tracking.config_hash(hash_payload)
     if mlflow_cfg.get("skip_duplicate_runs", True):
         tracking.check_duplicate_run(experiment_name, config_hash, force=force)
 
-    panel = load_panel_from_config(config)
-    df = build_feature_matrix(panel, config)
+    periods = resolve_periods(config)
+    if periods.errors:
+        raise ValueError("; ".join(periods.errors))
 
-    max_lag = max_lag_from_config(config)
-    embargo = config["forecasting"]["validation"]["embargo_weeks"]
-    if embargo < max_lag:
-        raise ValueError(f"embargo_weeks ({embargo}) must be >= max lag ({max_lag})")
+    panel = load_panel_from_config(
+        config, start=periods.data_start, end=periods.data_end
+    )
+    df = build_feature_matrix(panel, config)
+    df_fc = df[df["date"] <= periods.forecaster_cv_end].copy()
 
     horizons = config["forecasting"]["model"]["horizons"]
     val_cfg = config["forecasting"]["validation"]
@@ -265,16 +378,29 @@ def run_pipeline(config_path: str | None = None, force: bool = False) -> dict:
             "primary_metric": primary_metric,
             "n_folds": val_cfg["n_folds"],
             "fold_size_weeks": val_cfg["fold_size_weeks"],
-            "embargo_weeks": val_cfg["embargo_weeks"],
+            "gap_weeks": periods.gap_weeks,
+            "label_gap_weeks": periods.label_gap_weeks,
             "min_train_size_weeks": val_cfg["min_train_size_weeks"],
             "horizons": str(horizons),
             "n_features": len(get_feature_columns(df)),
             "n_skus": df.groupby(["store", "product"]).ngroups,
             "n_weeks": df["date"].nunique(),
             "oos_masking": True,
+            "rl_train_start": str(periods.rl_train_start.date()),
+            "rl_train_end": str(periods.rl_train_end.date()),
+            "rl_val_start": str(periods.rl_val_start.date()),
+            "rl_val_end": str(periods.rl_val_end.date()),
+            "rl_test_start": str(periods.rl_test_start.date()),
+            "rl_test_end": str(periods.rl_test_end.date()),
+            "refit_per_block": periods.refit_per_block,
         }
         if forecaster_type == "quantile":
             run_params["quantiles"] = str(config["forecasting"]["model"]["quantiles"])
+            ltd_cfg = config["forecasting"]["model"].get("lead_time_demand", {})
+            if ltd_cfg.get("enabled", False):
+                run_params["ltd_enabled"] = True
+                run_params["ltd_offsets"] = str(ltd_cfg.get("offsets", [0, 1, 2]))
+                run_params["ltd_quantiles"] = str(ltd_cfg.get("quantiles", []))
         mlflow.log_params(run_params)
 
         # --- Step 1: model selection (optional) ---
@@ -282,11 +408,11 @@ def run_pipeline(config_path: str | None = None, force: bool = False) -> dict:
         champion_model_params: dict | None = None
 
         if sel_cfg.get("enabled", False):
-            candidates = _run_model_selection(df, config)
+            candidates = _run_model_selection(df_fc, config)
 
             # --- Step 2: hypertune survivors (optional) ---
             if tune_cfg.get("enabled", False):
-                champion = _run_tuning(candidates, df, config)
+                champion = _run_tuning(candidates, df_fc, config)
                 champion_model_name = champion["model_name"]
                 champion_model_params = champion["best_params"]
             else:
@@ -297,7 +423,7 @@ def run_pipeline(config_path: str | None = None, force: bool = False) -> dict:
             # Tune only the configured (or default) model, skip selection
             default_model = tune_cfg.get("model", "lightgbm")
             from src.forecasting.tuning import tune_model
-            result = tune_model(default_model, df, config)
+            result = tune_model(default_model, df_fc, config)
             champion_model_name = default_model
             champion_model_params = result["best_params"]
             mlflow.log_metric(f"champion_tuned_{primary_metric}", result["best_value"])
@@ -310,9 +436,11 @@ def run_pipeline(config_path: str | None = None, force: bool = False) -> dict:
 
         # --- Step 3: full CV with champion ---
         oof, cv_metrics, fold_metrics = run_cross_validation(
-            df, config,
+            df_fc,
+            config,
             model_name=champion_model_name,
             model_params=champion_model_params,
+            folds=periods.folds,
         )
 
         for k, v in cv_metrics.items():
@@ -325,25 +453,25 @@ def run_pipeline(config_path: str | None = None, force: bool = False) -> dict:
         if fold_metrics:
             tracking.log_dataframe(pd.DataFrame(fold_metrics), artifact_path="cv_detail")
 
-        # --- Step 4: retrain on full data with champion ---
-        feature_cols = get_feature_columns(df)
-        forecaster = ForecasterClass(
+        if not oof.empty:
+            log_cv_entity_metrics(oof, config)
+
+        # --- Step 4: out-of-sample forecasts per RL block ---
+        full_scored, block_metrics, forecaster = _fit_rl_block_forecasts(
+            df,
             config,
-            model_name=champion_model_name,
-            model_params=champion_model_params,
+            periods,
+            ForecasterClass,
+            champion_model_name,
+            champion_model_params,
         )
-        forecaster.fit(df, feature_cols=feature_cols)
-        full_scored = forecaster.predict(df, feature_cols=feature_cols)
+        for k, v in block_metrics.items():
+            mlflow.log_metric(k, v)
+        for w in periods.warnings:
+            mlflow.set_tag(f"warning_{len(w)}", w[:250])
 
-        # Full-data metrics per horizon
-        for h in horizons:
-            m = forecaster.evaluate_horizon(full_scored, horizon=h)
-            for k, v in m.items():
-                if isinstance(v, (int, float)) and np.isfinite(float(v)):
-                    mlflow.log_metric(f"train_{k}_h{h}", float(v))
-
-        # Feature importances
-        _log_feature_importances(forecaster)
+        if forecaster is not None:
+            _log_feature_importances(forecaster)
 
         # --- Save artifacts ---
         model_dir = root / config["forecasting"]["artifacts"]["model_dir"]
@@ -354,8 +482,9 @@ def run_pipeline(config_path: str | None = None, force: bool = False) -> dict:
             else "quantile_forecaster.joblib"
         )
         model_path = model_dir / artifact_name
-        forecaster.save(model_path)
-        mlflow.log_artifact(str(model_path))
+        if forecaster is not None:
+            forecaster.save(model_path)
+            mlflow.log_artifact(str(model_path))
 
         forecasts_dir = root / config["forecasting"]["artifacts"]["forecasts_dir"]
         forecasts_dir.mkdir(parents=True, exist_ok=True)
@@ -363,12 +492,22 @@ def run_pipeline(config_path: str | None = None, force: bool = False) -> dict:
             ["store", "product", "date", "sales"]
             + [c for c in full_scored.columns if c.startswith(("mu_h", "sigma_h", "pred_q"))]
         )
-        full_scored[forecast_cols].to_parquet(forecasts_dir / "train_forecasts.parquet", index=False)
+        if not full_scored.empty:
+            _keep_previous_forecasts(config)
+            fc_path = forecasts_dir / "train_forecasts.parquet"
+            full_scored[forecast_cols].to_parquet(fc_path, index=False)
+            mlflow.log_artifact(str(fc_path), artifact_path="forecasts")
+        run = mlflow.active_run()
+        run_id = run.info.run_id if run is not None else None
+        record = build_setup_record(config, periods, run_id=run_id)
+        setup_path = save_setup(config, record)
+        mlflow.log_artifact(str(setup_path), artifact_path="forecasts")
         if not oof.empty:
             oof_cols = [c for c in forecast_cols if c in oof.columns] + ["fold_id"]
-            oof[[c for c in oof_cols if c in oof.columns]].to_parquet(
-                forecasts_dir / "oof_forecasts.parquet", index=False
-            )
+            oof_export = oof[[c for c in oof_cols if c in oof.columns]]
+            oof_path = forecasts_dir / "oof_forecasts.parquet"
+            oof_export.to_parquet(oof_path, index=False)
+            mlflow.log_artifact(str(oof_path), artifact_path="forecasts")
 
         mlflow.log_dict(cv_metrics, "cv_metrics.json")
         return {"cv_metrics": cv_metrics, "model_path": str(model_path)}

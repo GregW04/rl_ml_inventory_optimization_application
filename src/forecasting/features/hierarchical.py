@@ -57,7 +57,7 @@ def add_hierarchical_features(
             group_ts[f"grp_lag_{lag}w_{slug}"] = g.shift(lag)
         for window in group_rolling_windows:
             group_ts[f"grp_roll_mean_{window}w_{slug}"] = g.transform(
-                lambda s, w=window: s.rolling(window=w, min_periods=1).mean()
+                lambda s, w=window: s.shift(1).rolling(window=w, min_periods=1).mean()
             )
 
         merge_cols = level + ["date"] + [
