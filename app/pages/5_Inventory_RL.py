@@ -60,8 +60,16 @@ for key, title in [("ep_reward_mean", "Episode reward"), ("fill_rate_mean", "Fil
 st.subheader("Order recommendations")
 agent_type = st.selectbox("Agent policy", ["ppo", "dqn"])
 model_path = lib.rl_model_path(agent_type)
+sidecar = lib.agent_meta(agent_type)
 if not model_path.exists():
-    st.info(f"No saved `{agent_type}` agent at `{model_path.name}`. Train it first.")
+    if sidecar.get("deployed_policy") == "base_stock":
+        st.info(
+            "The latest training run did not beat base-stock on validation, so no RL "
+            "agent was deployed. Use **Experiments** or policy evaluation for the "
+            "base-stock baseline."
+        )
+    else:
+        st.info(f"No saved `{agent_type}` agent at `{model_path.name}`. Train it first.")
     st.stop()
 
 

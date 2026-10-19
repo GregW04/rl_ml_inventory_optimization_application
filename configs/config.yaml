@@ -140,7 +140,7 @@ rl:
     order_cap_mult: 1.0       # per-SKU cap = mult * that SKU's peak historical weekly sales
     min_order_cap: 1.0        # avoid a degenerate zero cap for never-sold SKUs
     normalize_action: true    # (ignored when residual_mode) action as fraction of cap
-    scale_obs_by_cap: false    # on-hand, pipeline, and weekly quantiles in units of the SKU cap
+    scale_obs_by_cap: true    # on-hand, pipeline, and weekly quantiles in units of the SKU cap
     per_sku_reward_norm: false # OFF: equal-weighting de-prioritized high-volume SKUs (67% of cost) and hurt the real objective
     residual_mode: true      # direct RL: agent emits the order fraction itself (classic PPO/DQN)
     residual_floor_frac: 0.25 # min correction scale = frac * order_cap (used only when residual_mode)
@@ -152,7 +152,6 @@ rl:
       learning_rate: 0.0003
       n_steps: 2048
       batch_size: 64
-      n_epochs: 10
       gamma: 0.99
       ent_coef: 0.05
       total_timesteps: 10000000  # longer run
@@ -162,7 +161,7 @@ rl:
       # Fine at the low end to trim holding cost, broad higher up.
       order_buckets: [0.0, 0.02, 0.05, 0.1, 0.2, 0.35, 0.6, 1.0]
       # residual_mode: signed corrections on base-stock (fractions of the residual scale)
-      residual_buckets: [-1.0, -0.5, -0.25, -0.1, -0.05, 0.0, 0.05, 0.1, 0.25, 0.5, 1.0]
+      residual_buckets: [-1.0, -0.5, -0.25, -0.1, -0.05, -0.02, 0.0, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0]
       learning_rate: 0.0001
       buffer_size: 50000
       learning_starts: 1000

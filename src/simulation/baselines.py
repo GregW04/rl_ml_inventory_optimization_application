@@ -8,7 +8,9 @@ Observation layout (see ``InventoryEnv._obs``)::
 
     [0] inventory            [1] in_transit_1w     [2] in_transit_2w
     [3] q10_h0 [4] q50_h0 [5] q90_h0  ... h1, h2
-    [12] store_id            [13] product_id
+    [12] base_stock_order/cap  [13] zero_share  [14] pos_cv
+
+Policies read only ``[0:12]``; the tail is for the RL agent.
 
 When the env is constructed with ``scale_obs_by_cap``, entries ``[0:12]`` are
 fractions of that SKU's order cap. ``info["obs_scale"]`` is the cap (or 1 when

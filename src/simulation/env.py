@@ -12,11 +12,12 @@ from gymnasium import spaces
 from src.simulation.reward import compute_reward
 
 
-OBS_DIM = 14
+OBS_DIM = 15
 # On-hand, two pipeline slots, and q10/q50/q90 × h0/h1/h2. These share units
-# with the fraction action when ``scale_obs_by_cap`` is on. Store and product
-# ids (the last two entries) stay raw.
+# with the fraction action when ``scale_obs_by_cap`` is on.
 OBS_SCALED_DIM = 12
+# Tail: base-stock order / cap, past zero-week share, past positive-week CV.
+OBS_TAIL_DIM = 3
 # Forecast quantiles exposed in the observation (per horizon h0/h1/h2).
 _FC_QUANTILES = (10, 50, 90)
 # Lead-time demand quantiles (info only — not part of the 14-dim observation).
@@ -38,17 +39,15 @@ def _obs_high(order_cap: float, scale_by_cap: bool = False) -> np.ndarray:
     return np.array(
         [inv_high, inv_high, inv_high]   # inventory + 2 in-transit slots
         + [demand_high] * 9              # q10/q50/q90 for h0,h1,h2
-        + [50.0, 1000.0],               # store, product ids
+        + [1.0, 1.0, 5.0],              # base_order/cap, zero_share, pos_cv
         dtype=np.float32,
     )
 
 
-def _finite_obs(
+def _inventory_forecast_obs(
     inventory: float,
     in_transit: list[float],
     fc: dict[str, float],
-    store: float,
-    product: float,
     order_cap: float,
     scale_by_cap: bool = False,
 ) -> np.ndarray:
@@ -67,23 +66,21 @@ def _finite_obs(
     quants = [
         fc.get(f"q{q}_h{h}", 0.0) for h in range(3) for q in _FC_QUANTILES
     ]
-    obs = np.array(
-        [inventory, it0, it1] + quants + [store, product],
-        dtype=np.float32,
-    )
+    obs = np.array([inventory, it0, it1] + quants, dtype=np.float32)
     np.nan_to_num(obs, copy=False, nan=0.0, posinf=500.0, neginf=0.0)
     if scale_by_cap:
         obs[:OBS_SCALED_DIM] /= max(float(order_cap), 1e-6)
-    return np.clip(obs, 0.0, _obs_high(order_cap, scale_by_cap=scale_by_cap))
+    high = _obs_high(order_cap, scale_by_cap=scale_by_cap)
+    return np.clip(obs, 0.0, high[:OBS_SCALED_DIM])
 
 
 class InventoryEnv(gym.Env):
     """
     Single store-product weekly inventory environment.
 
-    State: inventory, in_transit_1w/2w, q10/q50/q90 for h=0,1,2, store_id, product_id.
-    With ``scale_obs_by_cap``, the first twelve entries are fractions of the SKU
-    order cap (same unit as a normalized order). Store and product ids stay raw.
+    State: inventory, pipeline, forecast quantiles (12), then base-stock order/cap,
+    past zero-week share, and past positive-week CV (3).
+    With ``scale_obs_by_cap``, the first twelve entries are fractions of the SKU cap.
     Action: order quantity (continuous) or discrete bucket index when using DQN wrapper
 
     Replenishment: an order placed at week t arrives **in full** at t + lead_time_weeks
@@ -130,19 +127,16 @@ class InventoryEnv(gym.Env):
         self.scale_obs_by_cap = bool(scale_obs_by_cap)
         self._obs_scale = float(self.order_cap if self.scale_obs_by_cap else 1.0)
 
-        # Residual mode: the action is a correction on top of a base-stock order.
-        self._baseline = None
-        if residual_mode:
-            from src.simulation.baselines import BaseStockPolicy
-            self._baseline = BaseStockPolicy(
-                holding_cost=holding_cost,
-                shortage_cost=shortage_cost,
-                lead_time_weeks=self.lead_time_weeks,
-                max_order=float("inf"),  # env applies the per-SKU cap
-            )
-            # Baseline reads units. ``obs_scale`` restores them when the
-            # observation is expressed as a fraction of the order cap.
-            self._baseline.update_info({"obs_scale": self._obs_scale})
+        from src.simulation.baselines import BaseStockPolicy
+
+        # Base-stock order is both an observation feature and the residual anchor.
+        self._baseline = BaseStockPolicy(
+            holding_cost=holding_cost,
+            shortage_cost=shortage_cost,
+            lead_time_weeks=self.lead_time_weeks,
+            max_order=float("inf"),  # env applies the per-SKU cap
+        )
+        self._baseline.update_info({"obs_scale": self._obs_scale})
 
         self._t = 0
         self.inventory = 0.0
@@ -217,15 +211,22 @@ class InventoryEnv(gym.Env):
     def _obs(self) -> np.ndarray:
         fc = self._get_forecast_row(self.episode_data.loc[self._t, "date"])
         row = self.episode_data.loc[self._t]
-        return _finite_obs(
+        core = _inventory_forecast_obs(
             self.inventory,
             self.in_transit,
             fc,
-            float(row["store"]),
-            float(row["product"]),
             self.order_cap,
             scale_by_cap=self.scale_obs_by_cap,
         )
+        pad = np.zeros(OBS_TAIL_DIM, dtype=np.float32)
+        base_qty = self._baseline.order_quantity(np.concatenate([core, pad]))
+        cap = max(float(self.order_cap), 1e-6)
+        base_frac = float(np.clip(base_qty / cap, 0.0, 1.0))
+        zero_share = float(row.get("zero_share", 0.0) or 0.0)
+        pos_cv = float(row.get("pos_cv", 0.0) or 0.0)
+        tail = np.array([base_frac, zero_share, min(5.0, pos_cv)], dtype=np.float32)
+        high = _obs_high(self.order_cap, scale_by_cap=self.scale_obs_by_cap)
+        return np.clip(np.concatenate([core, tail]), 0.0, high)
 
     def reset(
         self, seed: int | None = None, options: dict[str, Any] | None = None

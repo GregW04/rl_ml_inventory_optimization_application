@@ -197,6 +197,34 @@ def compute_order_caps(
     return caps
 
 
+def _attach_demand_shape_features(grp: pd.DataFrame) -> pd.DataFrame:
+    """Past-only zero-week share and CV of positive weeks (strictly before each row)."""
+    grp = grp.sort_values("date").reset_index(drop=True)
+    n = len(grp)
+    zero_share = np.zeros(n, dtype=np.float64)
+    pos_cv = np.zeros(n, dtype=np.float64)
+    n_past = 0
+    n_zero = 0
+    pos_vals: list[float] = []
+    for i in range(n):
+        if n_past > 0:
+            zero_share[i] = n_zero / n_past
+            if len(pos_vals) >= 2:
+                mu = float(np.mean(pos_vals))
+                if mu > 0:
+                    pos_cv[i] = min(5.0, float(np.std(pos_vals)) / mu)
+        sales = float(grp.loc[i, "sales"]) if pd.notna(grp.loc[i, "sales"]) else 0.0
+        n_past += 1
+        if sales <= 0:
+            n_zero += 1
+        else:
+            pos_vals.append(sales)
+    grp = grp.copy()
+    grp["zero_share"] = zero_share
+    grp["pos_cv"] = pos_cv
+    return grp
+
+
 def build_episodes(
     panel: pd.DataFrame,
     start: pd.Timestamp,
@@ -221,6 +249,7 @@ def build_episodes(
 
     episodes: dict[tuple[int, int], pd.DataFrame] = {}
     for (store, product), grp in slim.groupby(["store", "product"], observed=True):
+        grp = _attach_demand_shape_features(grp)
         ep = grp[(grp["date"] >= start) & (grp["date"] <= end)]
         if len(ep) < lead + 2:
             continue
@@ -456,6 +485,29 @@ class BestCheckpointCallback(BaseCallback):
             keys = [keys[i] for i in rng.choice(len(keys), n_eval_skus, replace=False)]
         self._eval_subset = {k: eval_episodes[k] for k in keys}
 
+        from src.rl.evaluate import rollout_policy
+        from src.simulation.baselines import BaseStockPolicy
+
+        env_cfg = config["rl"]["environment"]
+        base_stock = BaseStockPolicy(
+            holding_cost=env_cfg["holding_cost"],
+            shortage_cost=env_cfg["shortage_cost"],
+            lead_time_weeks=env_cfg["lead_time_weeks"],
+            max_order=float("inf"),
+        )
+        bs_kpis = rollout_policy(
+            base_stock,
+            self._eval_subset,
+            self.eval_lookup,
+            self.config,
+            order_caps=self.order_caps,
+            normalize_action=False,
+            residual_mode=False,
+            discrete_buckets=None,
+        )
+        self.base_stock_reward = float(bs_kpis["mean_reward_per_sku"])
+        self.best_reward = self.base_stock_reward
+
     def _on_step(self) -> bool:
         if self.n_calls % self.eval_freq != 0:
             return True
@@ -473,6 +525,12 @@ class BestCheckpointCallback(BaseCallback):
         mlflow.log_metric("heldout_fill", kpis["fill_rate"], step=self.num_timesteps)
         mlflow.log_metric("heldout_holding", holding, step=self.num_timesteps)
         mlflow.log_metric("heldout_shortage", shortage, step=self.num_timesteps)
+        mlflow.log_metric(
+            "heldout_base_stock_reward", self.base_stock_reward, step=self.num_timesteps
+        )
+        mlflow.log_metric(
+            "heldout_minus_base_stock", r - self.base_stock_reward, step=self.num_timesteps
+        )
         if r > self.best_reward:
             self.best_reward = r
             self.best_step = self.num_timesteps
@@ -575,6 +633,9 @@ def train_agent(
         model_dir.mkdir(parents=True, exist_ok=True)
         model_path = model_dir / f"{agent_type}_inventory.zip"
         best_path = model_dir / f"{agent_type}_inventory_best.zip"
+        # A leftover checkpoint from a previous run must not count as this run's winner.
+        if best_path.exists():
+            best_path.unlink()
 
         # Held-out checkpoint selection: keep the best-on-eval snapshot (no early stop).
         eval_episodes, eval_lookup, _ = prepare_block(config, "rl_val")
@@ -601,9 +662,13 @@ def train_agent(
         # Training curves chart
         metrics_cb.log_training_chart(agent_type)
 
-        # Deploy the best-on-held-out checkpoint as the main artifact (fall back to
-        # the final model if no checkpoint ever improved).
-        if best_path.exists():
+        # Deploy only if this run saved a checkpoint that beat base-stock.
+        beat_base_stock = best_cb.best_step >= 0 and best_path.exists()
+        deployed_policy = agent_type if beat_base_stock else "base_stock"
+        mlflow.log_param("deployed_policy", deployed_policy)
+        mlflow.log_metric("heldout_base_stock_reward", best_cb.base_stock_reward)
+
+        if beat_base_stock:
             best_agent = type(agent).load(str(best_path))
             best_agent.save(str(model_path))
             mlflow.log_metric("best_heldout_reward", best_cb.best_reward)
@@ -615,20 +680,26 @@ def train_agent(
                 mlflow.log_metric("best_heldout_shortage", best_cb.best_shortage)
                 summary["best_heldout_holding"] = best_cb.best_holding
                 summary["best_heldout_shortage"] = best_cb.best_shortage
-        else:
-            agent.save(str(model_path))
-        mlflow.log_artifact(str(model_path))
+            mlflow.log_artifact(str(model_path))
+        elif model_path.exists():
+            model_path.unlink()
+
+        sidecar = {
+            "forecast_run_id": setup.get("run_id"),
+            "rl_run_id": mlflow.active_run().info.run_id,
+            "total_timesteps": timesteps,
+            "deployed_policy": deployed_policy,
+            "heldout_base_stock_reward": best_cb.base_stock_reward,
+        }
+        if beat_base_stock:
+            sidecar["best_heldout_reward"] = best_cb.best_reward
+            sidecar["best_heldout_step"] = best_cb.best_step
         model_path.with_suffix(".json").write_text(
-            json.dumps(
-                {
-                    "forecast_run_id": setup.get("run_id"),
-                    "rl_run_id": mlflow.active_run().info.run_id,
-                    "total_timesteps": timesteps,
-                },
-                indent=2,
-            ),
+            json.dumps(sidecar, indent=2),
             encoding="utf-8",
         )
+        summary["deployed_policy"] = deployed_policy
+        summary["heldout_base_stock_reward"] = best_cb.base_stock_reward
 
         # Persist reward-normalization stats so eval/inference reload the same scale.
         vecnorm_path = model_dir / f"{agent_type}_vecnormalize.pkl"
