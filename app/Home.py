@@ -11,18 +11,25 @@ for _p in _here.parents:
         sys.path.insert(0, str(_p))
         break
 
+import pandas as pd
 import streamlit as st
 
 from app import lib
+from src.rl.selection import champion
 from src.utils import tracking
 
 st.set_page_config(page_title="Inventory Optimization", page_icon="📦", layout="wide")
 
 st.title("📦 RL-ML Inventory Optimization")
 st.caption(
-    "Two-stage VN2 workflow: demand forecasting → RL ordering. "
-    "Trigger runs, browse MLflow experiments, and inspect forecasts & inventory policy — "
-    "all backed by a single MLflow store."
+    "Two-stage VN2 workflow: forecast the measures you choose (refit every n weeks, one "
+    "model or an ensemble) → lost-sales anchor → RL (PPO, GRPO or the DQN baseline; residual "
+    "on the anchor, or raw) trained on train, selected on validation, shipped to test once. "
+    "Costs are reported in euros (€)."
+)
+ok, msgs = lib.vn2_compliance_badge()
+st.markdown(
+    f"**VN2 comparability:** {'✅' if ok else '⚠️'} " + "; ".join(msgs)
 )
 
 uri = lib.init_tracking()
@@ -41,39 +48,35 @@ else:
         rows.append({"experiment": e["name"], "runs": 0 if runs.empty else len(runs)})
     st.dataframe(rows, hide_index=True, width="stretch")
 
-st.subheader("Latest champions")
-col1, col2 = st.columns(2)
-
-with col1:
-    st.markdown(f"**Forecasting** · `{exps['forecasting']}`")
-    best = tracking.best_run(exps["forecasting"], "cv_mae_mean", mode="min")
-    if best is None:
-        st.write("— no scored runs yet —")
-    else:
-        st.metric("Best CV MAE (mean)", f"{best['metrics.cv_mae_mean']:.4f}")
-        champ = best.get("params.champion_model", "?")
-        st.caption(f"champion model: `{champ}` · run `{best['run_id'][:8]}`")
-
-with col2:
-    st.markdown(f"**Inventory RL** · `{exps['rl']}`")
-    best_rl = tracking.best_run(exps["rl"], "final_ep_reward_mean", mode="max")
-    if best_rl is None:
-        st.write("— no RL runs yet —")
-    else:
-        st.metric("Best episode reward (mean)", f"{best_rl['metrics.final_ep_reward_mean']:.3f}")
-        fr = best_rl.get("metrics.final_fill_rate")
-        agent = best_rl.get("params.agent", "?")
-        st.caption(
-            f"agent: `{agent}` · fill rate: "
-            f"{fr:.2%}" if fr is not None else f"agent: `{agent}`"
-        )
+st.subheader("Forecasting runs and their champions")
+fc_runs = lib.forecast_runs()
+if fc_runs.empty:
+    st.write("— no finished forecasting runs yet —")
+else:
+    rows = []
+    for _, r in fc_runs.head(8).iterrows():
+        board = lib.rl_leaderboard(r["run_id"])
+        champ = champion(board)
+        tests = lib.test_scores(r["run_id"])
+        rows.append({
+            "forecasting run": lib.forecast_run_label(r),
+            "measures": r.get("params.measures") or "(legacy)",
+            "RL configurations": int((board["kind"] == "rl").sum()) if not board.empty else 0,
+            "validation champion": "anchor" if champ is None or champ["kind"] == "anchor" else champ["candidate"],
+            "test (production)": (
+                f"{tests.iloc[0]['metrics.test_cost_eur_per_sku']:.3f} € / SKU-window"
+                + (" · post-hoc" if tests.iloc[0].get("tags.post_hoc") == "true" else "")
+                if not tests.empty else "not scored"
+            ),
+        })
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
 st.divider()
 st.markdown(
     "Use the pages in the sidebar:\n"
-    "1. **Run Forecasting** — set periods & features, preview the timeline, launch forecasting\n"
-    "2. **Run RL** — pick a forecasting run, see its frozen split, train / evaluate agents\n"
+    "1. **Run Forecasting** — set periods, refit cadence, features, measures and the ensemble, preview the folds, launch\n"
+    "2. **Run RL** — pick a forecasting run, choose state and method, train, compare on validation, score test once\n"
     "3. **Experiments** — browse & compare MLflow runs\n"
-    "4. **Forecasts** — actual vs predicted, prediction intervals, feature importance\n"
-    "5. **Inventory & RL** — training curves, fill-rate KPIs, order recommendations"
+    "4. **Forecasts** — actual vs forecast per horizon, coverage, feature importance\n"
+    "5. **Inventory & RL** — a training run's curve, validation result and order recommendations"
 )

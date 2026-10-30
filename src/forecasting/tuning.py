@@ -1,8 +1,9 @@
 """
 Optuna-based hyperparameter tuning for demand forecasters.
 
-Objective: mean primary metric (wQL or MAE) across horizons, averaged over
-the ``n_cv_folds`` most-recent CV folds.
+Objective: the primary measure's proper score (pinball for a quantile, RMSE for a
+mean), averaged over the ``n_cv_folds`` most-recent CV folds. Only the primary
+measure's booster is fitted per trial; the winning parameters are shared by all.
 """
 
 from __future__ import annotations
@@ -13,11 +14,9 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from src.forecasting.model import (
-    get_feature_columns,
-    get_forecaster_class,
-    get_primary_metric,
-)
+from src.forecasting.forecaster import MeasureForecaster
+from src.forecasting.measures import primary_measure, primary_metric_name
+from src.forecasting.model import get_feature_columns
 from src.forecasting.registry import get_spec, sample_params
 from src.forecasting.validation import get_unique_dates, make_folds
 
@@ -66,10 +65,9 @@ def _build_objective(
     config: dict,
     feature_cols: list[str],
 ):
-    """Return an Optuna objective minimizing mean primary metric over folds."""
-    ForecasterClass = get_forecaster_class(config)
-    primary = get_primary_metric(config)
-    horizons = config["forecasting"]["model"]["horizons"]
+    """Return an Optuna objective minimizing the primary metric over folds."""
+    primary = primary_measure(config)
+    metric = primary_metric_name(primary)
 
     def objective(trial: Any) -> float:
         params = sample_params(trial, model_name)
@@ -77,23 +75,17 @@ def _build_objective(
 
         for train_df, val_df in fold_splits:
             try:
-                forecaster = ForecasterClass(
-                    config, model_name=model_name, model_params=params
+                forecaster = MeasureForecaster(
+                    config, model_name=model_name, model_params=params, measures=[primary]
                 )
                 forecaster.fit(train_df, feature_cols=feature_cols)
                 scored = forecaster.predict(val_df, feature_cols=feature_cols)
             except Exception as exc:
                 logger.debug("Trial raised during fit/predict: %s", exc)
                 return float("inf")
-
-            per_horizon: list[float] = []
-            for h in horizons:
-                m = forecaster.evaluate_horizon(scored, horizon=h)
-                if primary in m and np.isfinite(m[primary]):
-                    per_horizon.append(m[primary])
-
-            if per_horizon:
-                fold_scores.append(float(np.mean(per_horizon)))
+            score = forecaster.evaluate(scored).get(metric)
+            if score is not None and np.isfinite(score):
+                fold_scores.append(float(score))
 
         return float(np.mean(fold_scores)) if fold_scores else float("inf")
 
@@ -111,7 +103,7 @@ def tune_model(
     """Run an Optuna TPE study for ``model_name``."""
     import optuna
 
-    primary = get_primary_metric(config)
+    primary = primary_metric_name(primary_measure(config))
     tune_cfg = config.get("forecasting", {}).get("tuning", {})
     n_trials = tune_cfg.get("n_trials", n_trials)
     n_jobs = int(tune_cfg.get("n_jobs", 1) or 1)
@@ -205,7 +197,7 @@ def tune_candidates(
     config: dict,
 ) -> list[dict[str, Any]]:
     """Tune each candidate; return results sorted by best post-tuning metric."""
-    primary = get_primary_metric(config)
+    primary = primary_metric_name(primary_measure(config))
     results = []
     for model_name, default_score in candidates:
         logger.info(

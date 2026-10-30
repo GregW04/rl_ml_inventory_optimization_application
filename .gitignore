@@ -16,6 +16,7 @@ mlartifacts/
 
 # Generated artifacts (re-created by running the pipelines)
 artifacts/
+vendor/vn2_official/
 catboost_info/
 
 # Backups and temp

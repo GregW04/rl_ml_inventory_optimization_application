@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
@@ -33,19 +33,33 @@ def _black_friday(year: int) -> date:
     # weekday: Mon=0 ... Sun=6; Thanksgiving = 4th Thursday
     first_thu_offset = (3 - nov1.weekday()) % 7
     thanksgiving = nov1.replace(day=1 + first_thu_offset + 21)
-    from datetime import timedelta
-
     return thanksgiving + timedelta(days=1)
 
 
+def _second_monday_of_november(year: int) -> date:
+    """Start of the retailer's mid-November promo week (seen 2021–2023 in the VN2 data)."""
+    nov1 = date(year, 11, 1)
+    return nov1 + timedelta(days=(7 - nov1.weekday()) % 7 + 7)
+
+
+# Events available to the holiday features, in display order.
+EVENTS: tuple[str, ...] = (
+    "new_year", "easter", "halloween", "november_promo", "black_friday", "christmas", "summer_peak",
+)
+
+
 def _holiday_dates_for_year(year: int) -> dict[str, date]:
-    """Global-ish retail holidays mapped to a single anchor date per year."""
+    """Retail events mapped to a single anchor date per year (its week is the event week)."""
     return {
         "new_year": date(year, 1, 1),
         "easter": _easter_sunday(year),
         "halloween": date(year, 10, 31),
+        # Not ISO week 45/46: the promo starts on the second Monday of November each year.
+        "november_promo": _second_monday_of_november(year),
         "black_friday": _black_friday(year),
-        "christmas": date(year, 12, 25),
+        # Shopping peaks the week containing Christmas Eve; anchoring on Dec 25 puts the
+        # event one week late whenever Christmas falls on a Monday (2023).
+        "christmas": date(year, 12, 24),
         "summer_peak": date(year, 7, 15),
     }
 
@@ -123,10 +137,7 @@ def add_calendar_features(
     if not hol_cfg.get("enabled", True):
         return out
 
-    events = hol_cfg.get(
-        "events",
-        ["new_year", "easter", "halloween", "black_friday", "christmas", "summer_peak"],
-    )
+    events = hol_cfg.get("events", list(EVENTS))
     weeks_until_max = hol_cfg.get("weeks_until_max", 4)
     weeks_since_max = hol_cfg.get("weeks_since_max", 2)
 

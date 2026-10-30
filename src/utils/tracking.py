@@ -151,6 +151,7 @@ def search_runs(
     experiment_name: str,
     max_results: int = 200,
     order_by: list[str] | None = None,
+    filter_string: str = "",
 ) -> pd.DataFrame:
     """Search runs in an experiment; returns an empty frame if it doesn't exist."""
     experiment = mlflow.get_experiment_by_name(experiment_name)
@@ -160,6 +161,7 @@ def search_runs(
         experiment_ids=[experiment.experiment_id],
         max_results=max_results,
         order_by=order_by or ["attributes.start_time DESC"],
+        filter_string=filter_string,
     )
 
 
@@ -188,20 +190,3 @@ def download_artifact(run_id: str, artifact_path: str, dst_path: str | None = No
     return mlflow.artifacts.download_artifacts(
         run_id=run_id, artifact_path=artifact_path, dst_path=dst_path
     )
-
-
-def best_run(
-    experiment_name: str,
-    metric: str,
-    mode: str = "min",
-) -> pd.Series | None:
-    """Return the best run (as a row Series) for ``metric``; None if no runs."""
-    runs = search_runs(experiment_name, max_results=1000)
-    col = f"metrics.{metric}"
-    if runs.empty or col not in runs.columns:
-        return None
-    runs = runs.dropna(subset=[col])
-    if runs.empty:
-        return None
-    ascending = mode == "min"
-    return runs.sort_values(col, ascending=ascending).iloc[0]

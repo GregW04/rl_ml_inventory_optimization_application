@@ -1,4 +1,4 @@
-"""Set periods and features, preview how the data will be split, launch forecasting."""
+"""Set periods, features and forecast measures, preview the split, launch forecasting."""
 
 from __future__ import annotations
 
@@ -15,6 +15,15 @@ import pandas as pd
 import streamlit as st
 
 from app import lib
+from src.forecasting.features.calendar import EVENTS
+from src.forecasting.forecaster import MEAN_OBJECTIVES
+from src.forecasting.measures import (
+    CRITICAL_RATIO,
+    HORIZONS,
+    default_primary,
+    parse_measures,
+    validate_measures,
+)
 from src.forecasting.periods import (
     current_setup_hash,
     load_setup,
@@ -23,12 +32,13 @@ from src.forecasting.periods import (
     periods_to_dict,
     timeline,
 )
+from src.simulation.vn2 import VN2Rules
 
 st.set_page_config(page_title="Run Forecasting", page_icon="🚀", layout="wide")
 st.title("Run Forecasting")
 st.caption(
-    "Set periods and features, preview how the data will be used, then launch a forecasting "
-    "run. Train RL on a finished run from **Run RL**."
+    "Set periods, features and the measures to forecast per horizon, preview how the data "
+    "will be used, then launch a forecasting run. Train RL on a finished run from **Run RL**."
 )
 
 base_cfg = lib.get_config()
@@ -42,9 +52,23 @@ def _form_defaults(record: dict | None) -> dict:
     return {
         "periods": record.get("periods_input") or base_cfg.get("periods") or {},
         "forecasting": {
-            "forecaster_type": fc.get("forecaster_type", "quantile"),
+            "measures": list(fc.get("measures") or []),
+            "primary_measure": fc.get("primary_measure"),
+            "calibrate_quantiles": bool(fc.get("calibrate_quantiles", False)),
+            "model": {
+                "name": fc.get("model", {}).get("name", "lightgbm"),
+                "mean_objective": fc.get("model", {}).get("mean_objective", "poisson"),
+                "tweedie_variance_power": float(fc.get("model", {}).get("tweedie_variance_power", 1.5)),
+            },
             "validation": dict(fc["validation"]),
-            "model_selection": {"enabled": fc.get("model_selection", {}).get("enabled", False)},
+            "model_selection": {
+                "enabled": fc.get("model_selection", {}).get("enabled", False),
+                "candidates": list(fc.get("model_selection", {}).get("candidates", BACKENDS)),
+            },
+            "ensemble": {
+                "enabled": bool((fc.get("ensemble") or {}).get("enabled", False)),
+                "members": list((fc.get("ensemble") or {}).get("members") or ["catboost", "lightgbm"]),
+            },
             "tuning": {
                 "enabled": fc.get("tuning", {}).get("enabled", False),
                 "n_trials": int(fc.get("tuning", {}).get("n_trials", 50)),
@@ -54,11 +78,38 @@ def _form_defaults(record: dict | None) -> dict:
     }
 
 
+BACKENDS = ["lightgbm", "xgboost", "catboost"]
+RULES = VN2Rules.from_config(base_cfg)
+# Measure choices per horizon: label → (kind, tau). The critical ratio stays a token so
+# the saved config reads as the cost-optimal level, not a bare number.
+PRESETS: dict[str, tuple[str, object]] = {
+    "mean": ("mean", None),
+    "q50 (median)": ("quantile", 0.5),
+    f"q83 (critical ratio {RULES.critical_ratio:.1%})": ("quantile", CRITICAL_RATIO),
+    **{f"q{p}": ("quantile", p / 100) for p in (10, 25, 75, 90, 95, 97, 99)},
+}
+
+
+def _preset_label(entry: dict) -> str | None:
+    """Preset label of a config measure entry, or None when it is a custom level."""
+    kind, tau = entry.get("kind"), entry.get("tau")
+    if kind == "mean":
+        return kind
+    if isinstance(tau, str) or (tau is not None and abs(float(tau) - RULES.critical_ratio) < 0.005):
+        return next(k for k, v in PRESETS.items() if v[1] == CRITICAL_RATIO)
+    for label, (k, t) in PRESETS.items():
+        if k == "quantile" and isinstance(t, float) and abs(t - float(tau)) < 1e-9:
+            return label
+    return None
+
+
 # Widget keys carry a form version so Reset recreates every input. The form dict is
 # rewritten each run, so values survive a visit to another page.
-# Rev 2 is the horizon-only embargo and seasonal lags 51–53. An open session
-# still holding the previous form is moved onto the config.yaml defaults once.
-_FORM_REV = 2
+# Rev 3 adds forecast measures and the backend choice. Rev 4 adds the demand-profile
+# features and the mean objective, and drops measure kinds no longer offered. Rev 5
+# replaces the refit-per-block switch with a refit cadence and adds the ensemble. An open
+# session still holding a previous form is moved onto the config.yaml defaults once.
+_FORM_REV = 5
 if "fc_form" not in st.session_state or st.session_state.get("fc_form_rev") != _FORM_REV:
     migrating = "fc_form" in st.session_state
     st.session_state.fc_form = _form_defaults(None)
@@ -88,11 +139,12 @@ lag_cfg = feat.get("lags", {})
 cal_cfg = feat.get("calendar", {})
 hol_cfg = feat.get("holidays", {})
 hier_cfg = feat.get("hierarchical", {})
+prof_cfg = feat.get("demand_profile", {})
 
 left, right = st.columns([1, 1.2])
 
 with left:
-    tab_p, tab_f, tab_m = st.tabs(["Periods", "Features", "Model"])
+    tab_p, tab_f, tab_q, tab_m = st.tabs(["Periods", "Features", "Measures", "Model"])
 
     with tab_p:
         dr = st.select_slider(
@@ -109,19 +161,27 @@ with left:
         data_end = dr[1]
         c1, c2, c3 = st.columns(3)
         rl_train_w = c1.number_input(
-            "RL train weeks", 4, 80, int(pin.get("rl_train_weeks", 26)), key=k("rl_train_w")
+            "RL train weeks", 12, 80, int(pin.get("rl_train_weeks", 26)), key=k("rl_train_w")
         )
         rl_val_w = c2.number_input(
-            "RL validation weeks", 4, 40, int(pin.get("rl_val_weeks", 8)), key=k("rl_val_w")
+            "RL validation weeks", 8, 40, int(pin.get("rl_val_weeks", 8)), key=k("rl_val_w")
         )
         rl_test_w = c3.number_input(
-            "RL test weeks", 4, 40, int(pin.get("rl_test_weeks", 9)), key=k("rl_test_w")
+            "RL test weeks", 8, 40, int(pin.get("rl_test_weeks", 8)), key=k("rl_test_w")
         )
-        refit_per_block = st.toggle(
-            "Refit forecaster per RL block",
-            value=bool(pin.get("refit_per_block", True)),
-            key=k("refit"),
+        refit_every = st.number_input(
+            "Refit the forecaster every n weeks (0 = once per block)",
+            0,
+            52,
+            int(pin.get("refit_every_weeks", 13) or 0),
+            key=k("refit_every"),
+            help=(
+                "Applies inside the RL training and validation blocks. Each fit only uses "
+                "labels from before the weeks it forecasts, so shorter cadences keep the "
+                "training forecasts as fresh as the ones the agent is judged on."
+            ),
         )
+        st.caption("The test block always keeps one fit made before its first week (VN2 rule).")
         with st.expander("Forecast cross-validation"):
             val_cfg = fc_form["validation"]
             n_folds = st.number_input(
@@ -158,6 +218,17 @@ with left:
         )
         mom_on = st.toggle("Momentum", value=lag_cfg.get("momentum", True), key=k("mom"))
         hier_on = st.toggle("Hierarchy", value=hier_cfg.get("enabled", True), key=k("hier"))
+        prof_on = st.toggle(
+            "Demand profile",
+            value=bool(prof_cfg.get("enabled", False)),
+            key=k("profile"),
+            help=(
+                "Each SKU's profile from the trailing window ending last week: intermittency "
+                "(ADI, CV² of non-zero sales), level, volume percentile, weeks since the last "
+                "sale, its demand pattern (smooth, erratic, intermittent or lumpy) and its "
+                "volume tier."
+            ),
+        )
 
         lag_options = [1, 2, 4, 8, 13, 26, 51, 52, 53]
         lag_weeks = st.multiselect(
@@ -193,7 +264,7 @@ with left:
             disabled=not exp_on,
             key=k("exp_aggs"),
         )
-        all_events = ["new_year", "easter", "halloween", "black_friday", "christmas", "summer_peak"]
+        all_events = list(EVENTS)
         events = st.multiselect(
             "Holiday events",
             all_events,
@@ -215,20 +286,131 @@ with left:
             disabled=not hier_on,
             key=k("group_roll"),
         )
+        prof_window = st.select_slider(
+            "Demand profile window (weeks)",
+            [13, 26, 52],
+            value=int(prof_cfg.get("window_weeks", 52)),
+            disabled=not prof_on,
+            key=k("prof_window"),
+        )
+
+    with tab_q:
+        st.caption(
+            "Pick what to forecast for each week of the order: h0 = this week, h1 = next "
+            "week, h2 = delivery week. Each horizon needs a mean or a quantile so the anchor "
+            "can project stock."
+        )
+        measure_entries: list[dict] = []
+        saved = fc_form.get("measures") or []
+        for h in HORIZONS:
+            at_h = [e for e in saved if int(e.get("horizon", -1)) == h]
+            chosen = [lbl for e in at_h if (lbl := _preset_label(e))]
+            custom = [e for e in at_h if _preset_label(e) is None]
+            c1, c2 = st.columns([3, 1])
+            picks = c1.multiselect(
+                f"h{h}", list(PRESETS), default=[c for c in PRESETS if c in chosen], key=k(f"measures_h{h}")
+            )
+            extra = c2.text_input(
+                f"Other quantiles h{h} (%)",
+                ", ".join(f"{float(e['tau']) * 100:g}" for e in custom),
+                key=k(f"custom_h{h}"),
+                help="Comma-separated levels in percent, e.g. 60, 70",
+            )
+            for lbl in picks:
+                kind, tau = PRESETS[lbl]
+                measure_entries.append({"kind": kind, "horizon": h, **({"tau": tau} if tau is not None else {})})
+            for part in [x.strip() for x in extra.split(",") if x.strip()]:
+                try:
+                    measure_entries.append({"kind": "quantile", "horizon": h, "tau": float(part) / 100})
+                except ValueError:
+                    st.error(f"`{part}` is not a number (h{h} quantile levels).")
+        parsed = parse_measures({"forecasting": {"measures": measure_entries}, "vn2": base_cfg.get("vn2", {})})
+        levels = [m.id for m in parsed]
+        fallback = default_primary(parsed, RULES)
+        saved_primary = fc_form.get("primary_measure")
+        primary = st.selectbox(
+            "Primary measure (drives model selection and tuning)",
+            levels or ["—"],
+            index=(levels.index(saved_primary) if saved_primary in levels
+                   else levels.index(fallback.id) if fallback and fallback.id in levels else 0),
+            disabled=not levels,
+            key=k("primary"),
+            help="Pinball loss for a quantile, RMSE for a mean (their proper scores).",
+        )
+        calibrate = st.toggle(
+            "Calibrate quantiles (split-conformal, on out-of-fold data)",
+            value=bool(fc_form.get("calibrate_quantiles", False)),
+            key=k("calibrate"),
+            help="Shifts each quantile so its coverage on the CV region matches its level.",
+        )
+        measure_errors = validate_measures(parsed, primary if levels else None)
+        st.caption("Forecast columns: " + (", ".join(f"`{m.id}`" for m in parsed) or "none"))
+        for err in measure_errors:
+            st.error(err)
 
     with tab_m:
-        forecaster_type = st.selectbox(
-            "Forecaster type",
-            ["quantile", "mean"],
-            index=0 if fc_form.get("forecaster_type", "quantile") == "quantile" else 1,
-            key=k("forecaster_type"),
+        ens_cfg = fc_form.get("ensemble") or {}
+        enable_ensemble = st.toggle(
+            "Ensemble",
+            value=bool(ens_cfg.get("enabled", False)),
+            key=k("ensemble"),
+            help=(
+                "Fit every chosen backend at each fit and average their forecasts. "
+                "Model selection is off while this is on; tuning tunes each member."
+            ),
         )
-        if forecaster_type == "mean":
-            st.warning("RL expects quantile forecasts (Q10/Q50/Q90). Prefer quantile.")
+        members = st.multiselect(
+            "Ensemble members",
+            BACKENDS,
+            default=[m for m in (ens_cfg.get("members") or ["catboost", "lightgbm"]) if m in BACKENDS],
+            disabled=not enable_ensemble,
+            key=k("members"),
+        )
+        if enable_ensemble and len(members) < 2:
+            st.error("Pick at least two ensemble members.")
+        sel_cfg = fc_form["model_selection"]
         enable_selection = st.toggle(
             "Model selection",
-            value=bool(fc_form["model_selection"].get("enabled", False)),
+            value=bool(sel_cfg.get("enabled", False)) and not enable_ensemble,
             key=k("selection"),
+            disabled=enable_ensemble,
+            help="Score candidate backends with default parameters on the last CV fold.",
+        ) and not enable_ensemble
+        candidates = st.multiselect(
+            "Candidates",
+            BACKENDS,
+            default=[c for c in sel_cfg.get("candidates", BACKENDS) if c in BACKENDS],
+            disabled=not enable_selection,
+            key=k("candidates"),
+        )
+        backend = st.selectbox(
+            "Backend",
+            BACKENDS,
+            index=BACKENDS.index((fc_form.get("model") or {}).get("name", "lightgbm")),
+            disabled=enable_selection or enable_ensemble,
+            key=k("backend"),
+            help="Used when model selection and the ensemble are off.",
+        )
+        model_form = fc_form.get("model") or {}
+        mean_objective = st.selectbox(
+            "Mean loss",
+            MEAN_OBJECTIVES,
+            index=MEAN_OBJECTIVES.index(model_form.get("mean_objective", "poisson")),
+            key=k("mean_objective"),
+            help=(
+                "Loss of the mean boosters (mean_h*). Tweedie's variance grows as mean^p, "
+                "which suits zero-heavy, overdispersed demand; quantiles are unaffected."
+            ),
+        )
+        tweedie_power = st.slider(
+            "Tweedie variance power p",
+            1.1,
+            1.9,
+            float(model_form.get("tweedie_variance_power", 1.5)),
+            step=0.1,
+            disabled=mean_objective != "tweedie",
+            key=k("tweedie_power"),
+            help="Closer to 1 behaves like Poisson; closer to 2 like Gamma (heavier tails).",
         )
         enable_tuning = st.toggle(
             "Hyperparameter tuning",
@@ -251,16 +433,24 @@ overrides = {
         "rl_train_weeks": int(rl_train_w),
         "rl_val_weeks": int(rl_val_w),
         "rl_test_weeks": int(rl_test_w),
-        "refit_per_block": refit_per_block,
+        "refit_every_weeks": int(refit_every),
     },
     "forecasting": {
-        "forecaster_type": forecaster_type,
+        "measures": measure_entries,
+        "primary_measure": primary if levels else None,
+        "calibrate_quantiles": calibrate,
+        "model": {
+            "name": backend,
+            "mean_objective": mean_objective,
+            "tweedie_variance_power": round(float(tweedie_power), 2),
+        },
         "validation": {
             "n_folds": int(n_folds),
             "fold_size_weeks": int(fold_size),
             "min_train_size_weeks": int(min_train),
         },
-        "model_selection": {"enabled": enable_selection},
+        "model_selection": {"enabled": enable_selection, "candidates": candidates or BACKENDS},
+        "ensemble": {"enabled": enable_ensemble, "members": members or ["catboost", "lightgbm"]},
         "tuning": {"enabled": enable_tuning, "n_trials": int(n_trials)},
         "features": {
             "calendar": {
@@ -289,11 +479,16 @@ overrides = {
                 "group_rolling_windows": group_roll if hier_on else [],
                 "add_share_within_group": hier_cfg.get("add_share_within_group", True),
             },
+            "demand_profile": {
+                "enabled": prof_on,
+                "window_weeks": int(prof_window),
+            },
         },
     },
 }
 st.session_state.fc_form = overrides
 
+N_MEMBERS = len(members) if enable_ensemble else 1
 merged = lib.merged_config(overrides)
 periods = lib.resolve_from_config_dict(merged)
 
@@ -307,7 +502,14 @@ with right:
         f"Lags and rolling windows ({detail}) use earlier sales only, so a 52-week lag "
         "does not shorten training or drop CV folds."
     )
+    if not periods.errors:
+        lib.render_refit_preview(periods, n_members=N_MEMBERS)
     lib.render_split_view(timeline(periods), periods_to_dict(periods))
+    if not periods.errors:
+        chart = lib.age_chart(periods)
+        if chart is not None:
+            st.markdown("**Forecaster age at each order decision**")
+            st.altair_chart(chart, width="stretch")
     for err in periods.errors:
         st.error(err)
     for warn in periods.warnings:
@@ -325,7 +527,8 @@ b1, b2, _ = st.columns([1, 1, 2])
 run_fc = b1.button(
     "Run forecasting",
     type="primary",
-    disabled=bool(periods.errors) or fc_running,
+    disabled=bool(periods.errors) or bool(measure_errors) or fc_running
+    or (enable_ensemble and len(members) < 2),
     width="stretch",
 )
 if b2.button("Reset to config.yaml defaults", width="stretch"):

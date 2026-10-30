@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any
 
 import matplotlib
 matplotlib.use("Agg")
@@ -16,16 +15,28 @@ import pandas as pd
 from mlflow.exceptions import MlflowException
 from mlflow.tracking import MlflowClient
 
-from src.forecasting.model import (
-    build_feature_matrix,
-    get_feature_columns,
-    get_forecaster_class,
-    get_forecaster_type,
-    get_primary_metric,
-)
+from src.forecasting.calibration import fit_quantile_shifts
 from src.forecasting.entity_metrics import log_cv_entity_metrics
+from src.forecasting.forecaster import (
+    ENSEMBLE,
+    EnsembleForecaster,
+    MeasureForecaster,
+    ensemble_settings,
+    evaluate_measures,
+    make_forecaster,
+)
+from src.forecasting.measures import (
+    Measure,
+    manifest_record,
+    parse_measures,
+    primary_measure,
+    primary_metric_name,
+    validate_measures,
+)
+from src.forecasting.model import build_feature_matrix, get_feature_columns
 from src.forecasting.periods import (
     build_setup_record,
+    current_setup_hash,
     load_setup,
     resolve_periods,
     save_setup,
@@ -40,6 +51,7 @@ from src.utils.config import load_config
 def run_cross_validation(
     df: pd.DataFrame,
     config: dict,
+    measures: list[Measure],
     model_name: str = "lightgbm",
     model_params: dict | None = None,
     folds: list[TimeSeriesFold] | None = None,
@@ -49,170 +61,119 @@ def run_cross_validation(
         folds = make_folds(get_unique_dates(df), config)
 
     feature_cols = get_feature_columns(df)
-    ForecasterClass = get_forecaster_class(config)
     oof_parts = []
     fold_metrics = []
 
     for fold, train_mask, val_mask in iter_fold_masks(df, folds):
-        train_df = df.loc[train_mask].copy()
-        val_df = df.loc[val_mask].copy()
-
-        forecaster = ForecasterClass(
-            config, model_name=model_name, model_params=model_params
-        )
-        forecaster.fit(train_df, feature_cols=feature_cols)
-        scored = forecaster.predict(val_df, feature_cols=feature_cols)
+        forecaster = make_forecaster(config, model_name, model_params, measures)
+        forecaster.fit(df.loc[train_mask], feature_cols=feature_cols)
+        scored = forecaster.predict(df.loc[val_mask], feature_cols=feature_cols)
         scored["fold_id"] = fold.fold_id
         oof_parts.append(scored)
-
-        for h in config["forecasting"]["model"]["horizons"]:
-            m = forecaster.evaluate_horizon(scored, horizon=h)
-            m["fold_id"] = fold.fold_id
-            m["train_end"] = str(fold.train_end.date())
-            m["val_start"] = str(fold.val_start.date())
-            m["val_end"] = str(fold.val_end.date())
-            fold_metrics.append(m)
-
-        if getattr(forecaster, "ltd_enabled", False):
-            m_ltd = forecaster.evaluate_ltd(scored)
-            if m_ltd:
-                m_ltd["fold_id"] = fold.fold_id
-                m_ltd["train_end"] = str(fold.train_end.date())
-                m_ltd["val_start"] = str(fold.val_start.date())
-                m_ltd["val_end"] = str(fold.val_end.date())
-                fold_metrics.append(m_ltd)
+        fold_metrics.append(
+            {
+                "fold_id": fold.fold_id,
+                "train_end": str(fold.train_end.date()),
+                "val_start": str(fold.val_start.date()),
+                "val_end": str(fold.val_end.date()),
+                **forecaster.evaluate(scored),
+            }
+        )
 
     oof = pd.concat(oof_parts, ignore_index=True) if oof_parts else pd.DataFrame()
-
-    metrics_summary = {}
+    summary: dict[str, float] = {}
     if fold_metrics:
         mdf = pd.DataFrame(fold_metrics)
-        # Overall averages
-        for metric in ["mae", "smape", "mase", "wql"]:
-            if metric in mdf.columns:
-                metrics_summary[f"cv_{metric}_mean"] = float(mdf[metric].mean())
-        # Per-horizon averages
-        for h in config["forecasting"]["model"]["horizons"]:
-            hdf = mdf[mdf["horizon"] == h] if "horizon" in mdf.columns else mdf
-            for metric in ["mae", "mase", "wql"]:
-                if metric in hdf.columns:
-                    metrics_summary[f"cv_{metric}_h{h}_mean"] = float(hdf[metric].mean())
-
-        ltd_rows = [m for m in fold_metrics if m.get("target") == "S"]
-        if ltd_rows:
-            ldf = pd.DataFrame(ltd_rows)
-            for metric in ["mae", "mase", "wql"]:
-                if metric in ldf.columns:
-                    metrics_summary[f"cv_{metric}_S_mean"] = float(ldf[metric].mean())
-            if "picp_q83_S" in ldf.columns:
-                metrics_summary["cv_picp_q83_S_mean"] = float(ldf["picp_q83_S"].mean())
-
-    return oof, metrics_summary, fold_metrics
+        for col in mdf.columns:
+            if col in ("fold_id", "train_end", "val_start", "val_end"):
+                continue
+            val = float(mdf[col].mean(skipna=True))
+            if np.isfinite(val):
+                summary[f"cv_{col}"] = val
+    return oof, summary, fold_metrics
 
 
 def _log_fold_metrics(fold_metrics: list[dict]) -> None:
-    """Log per-fold, per-horizon metrics as MLflow step metrics."""
-    mdf = pd.DataFrame(fold_metrics)
-    if mdf.empty:
-        return
-    for _, row in mdf.iterrows():
+    """Log per-fold, per-measure metrics as MLflow step metrics (step = fold)."""
+    for row in fold_metrics:
         fold = int(row.get("fold_id", 0))
-        if row.get("target") == "S":
-            for metric in ["mae", "smape", "mase", "wql", "picp_q83_S"]:
-                val = row.get(metric)
-                if val is not None and np.isfinite(float(val)):
-                    mlflow.log_metric(f"{metric}_S", float(val), step=fold)
-            continue
-        horizon = row.get("horizon")
-        if horizon is None or not np.isfinite(float(horizon)):
-            continue
-        h = int(horizon)
-        for metric in ["mae", "smape", "mase", "wql"]:
-            val = row.get(metric)
+        for key, val in row.items():
+            if key in ("fold_id", "train_end", "val_start", "val_end"):
+                continue
             if val is not None and np.isfinite(float(val)):
-                mlflow.log_metric(f"{metric}_h{h}", float(val), step=fold)
+                mlflow.log_metric(key, float(val), step=fold)
 
 
-def _log_feature_importances(forecaster: Any, top_n: int = 30) -> None:
-    """Log feature importance for horizon-0 model (Q50 or mean)."""
-    models = forecaster.models
-    if (0, 0.5) in models:
-        model = models[(0, 0.5)]
-        title_suffix = "Q50 h=0"
-    elif 0 in models:
-        model = models[0]
-        title_suffix = "mean h=0"
-    else:
-        return
+def _importances(forecaster: MeasureForecaster, measure: Measure) -> pd.Series | None:
+    """Gain importance of the booster behind ``measure``, indexed by feature."""
+    model = forecaster.models.get(measure.id)
+    if model is None:
+        return None
     try:
         if forecaster.model_name == "lightgbm":
-            importances = model.booster_.feature_importance(importance_type="gain")
+            values = model.booster_.feature_importance(importance_type="gain")
         else:
-            importances = model.feature_importances_
+            values = model.feature_importances_
     except AttributeError:
-        return
-    names = forecaster.feature_cols
-    if len(names) != len(importances):
+        return None
+    if len(values) != len(forecaster.feature_cols):
+        return None
+    return pd.Series(np.asarray(values, dtype=float), index=forecaster.feature_cols)
+
+
+def _log_feature_importances(forecaster, measure: Measure, top_n: int = 30) -> None:
+    """Log feature importance of the primary measure (ensembles: mean of normalized gains)."""
+    if isinstance(forecaster, EnsembleForecaster):
+        parts = [imp / imp.sum() for m in forecaster.members.values()
+                 if (imp := _importances(m, measure)) is not None and imp.sum() > 0]
+        importance = pd.concat(parts, axis=1).mean(axis=1) if parts else None
+        label = f"{measure.id} model (ensemble mean of normalized gain)"
+    else:
+        importance = _importances(forecaster, measure)
+        label = f"{measure.id} model"
+    if importance is None:
         return
 
     imp_df = (
-        pd.DataFrame({"feature": names, "importance": importances})
+        importance.rename_axis("feature").reset_index(name="importance")
         .sort_values("importance", ascending=False)
         .head(top_n)
         .reset_index(drop=True)
     )
-
     tracking.log_dataframe(imp_df, artifact_path="feature_importance")
 
     fig, ax = plt.subplots(figsize=(8, max(4, top_n // 3)))
     ax.barh(imp_df["feature"][::-1], imp_df["importance"][::-1])
     ax.set_xlabel("Gain (importance)")
-    ax.set_title(f"Top feature importances — {title_suffix} model")
+    ax.set_title(f"Top feature importances — {label}")
     tracking.log_figure(fig, artifact_path="feature_importance")
 
 
-def _log_cv_chart(fold_metrics: list[dict], horizons: list[int]) -> None:
-    """Log a CV metric chart (MAE per fold, per horizon)."""
+def _log_cv_chart(fold_metrics: list[dict], metric: str) -> None:
+    """Log the primary metric per CV fold."""
     mdf = pd.DataFrame(fold_metrics)
-    if mdf.empty or "mae" not in mdf.columns:
+    if mdf.empty or metric not in mdf.columns:
         return
-
+    mdf = mdf.sort_values("fold_id")
     fig, ax = plt.subplots(figsize=(8, 4))
-    for h in horizons:
-        hdf = mdf[mdf["horizon"] == h].sort_values("fold_id")
-        if not hdf.empty:
-            ax.plot(hdf["fold_id"], hdf["mae"], marker="o", label=f"h={h}")
+    ax.plot(mdf["fold_id"], mdf[metric], marker="o")
     ax.set_xlabel("Fold")
-    ax.set_ylabel("MAE")
-    ax.set_title("CV MAE per fold and horizon")
-    ax.legend()
+    ax.set_ylabel(metric)
+    ax.set_title(f"CV {metric} per fold")
     tracking.log_figure(fig, artifact_path="cv_charts")
 
 
-def _log_oof_sample_chart(oof: pd.DataFrame) -> None:
-    """Log an OOF actual vs predicted chart for a sample SKU."""
-    if oof.empty or "mu_h0" not in oof.columns:
+def _log_oof_sample_chart(oof: pd.DataFrame, measures: list[Measure]) -> None:
+    """Log an OOF actual vs forecast chart (h0 measures) for the SKU with most rows."""
+    h0 = [m for m in measures if m.horizon == 0 and m.kind in ("mean", "quantile")]
+    if oof.empty or not h0 or h0[0].id not in oof.columns:
         return
-    # Pick the SKU with the most non-null OOF rows
-    key = (
-        oof.dropna(subset=["mu_h0"])
-        .groupby(["store", "product"])
-        .size()
-        .idxmax()
-    )
+    key = oof.dropna(subset=[h0[0].id]).groupby(["store", "product"]).size().idxmax()
     sku = oof[(oof["store"] == key[0]) & (oof["product"] == key[1])].sort_values("date")
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot(sku["date"], sku["sales"], label="Actual", color="steelblue")
-    ax.plot(sku["date"], sku["mu_h0"], label="Forecast mu (h=0)", color="orange", linestyle="--")
-    if "pred_q10_h0" in sku.columns and "pred_q90_h0" in sku.columns:
-        ax.fill_between(
-            sku["date"],
-            sku["pred_q10_h0"],
-            sku["pred_q90_h0"],
-            alpha=0.2,
-            color="orange",
-            label="Q10–Q90 interval",
-        )
+    for m in h0:
+        ax.plot(sku["date"], sku[m.id], label=m.id, linestyle="--")
     ax.set_title(f"OOF forecast — store={key[0]}, product={key[1]}")
     ax.set_xlabel("Date")
     ax.set_ylabel("Units")
@@ -220,94 +181,108 @@ def _log_oof_sample_chart(oof: pd.DataFrame) -> None:
     tracking.log_figure(fig, artifact_path="cv_charts")
 
 
-def _run_model_selection(
-    df: pd.DataFrame,
+def _choose_model(
+    df_fc: pd.DataFrame,
     config: dict,
-) -> list[tuple[str, float]]:
-    """Run model selection step and log results to the active MLflow run."""
-    from src.forecasting.model_selection import select_candidates
+    primary: Measure,
+) -> tuple[str, dict | None]:
+    """Model selection and/or tuning on the primary measure; return (backend, params)."""
+    sel_cfg = config["forecasting"].get("model_selection", {})
+    tune_cfg = config["forecasting"].get("tuning", {})
+    metric = primary_metric_name(primary)
+    name = config["forecasting"]["model"].get("name", "lightgbm")
 
-    primary = get_primary_metric(config)
-    candidates = select_candidates(df, config)
-    mlflow.log_param("selection_candidates", str([n for n, _ in candidates]))
-    for name, score in candidates:
-        mlflow.log_metric(f"selection_{primary}_{name}", score)
-    return candidates
+    ens_on, members = ensemble_settings(config)
+    if ens_on:
+        # The ensemble replaces model selection: every member is kept and averaged.
+        if sel_cfg.get("enabled", False):
+            mlflow.set_tag("note_model_selection", "skipped: the ensemble averages all members")
+        params: dict[str, dict | None] = {m: None for m in members}
+        if tune_cfg.get("enabled", False):
+            from src.forecasting.tuning import tune_model
 
+            for member in members:
+                result = tune_model(member, df_fc, config)
+                mlflow.log_metric(f"tuned_{metric}_{member}", result["best_value"])
+                mlflow.log_params({f"best_{member}_{k}": v for k, v in result["best_params"].items()})
+                params[member] = result["best_params"]
+        return ENSEMBLE, params
 
-def _run_tuning(
-    candidates: list[tuple[str, float]],
-    df: pd.DataFrame,
-    config: dict,
-) -> dict[str, Any]:
-    """Tune each candidate and log Optuna results; return champion info."""
-    from src.forecasting.tuning import tune_candidates
+    if sel_cfg.get("enabled", False):
+        from src.forecasting.model_selection import select_candidates
 
-    primary = get_primary_metric(config)
-    results = tune_candidates(candidates, df, config)
-    champion = results[0]
+        candidates = select_candidates(df_fc, config)
+        mlflow.log_param("selection_candidates", str([n for n, _ in candidates]))
+        for n, score in candidates:
+            mlflow.log_metric(f"selection_{metric}_{n}", score)
+        if not tune_cfg.get("enabled", False):
+            return candidates[0][0], None
+        from src.forecasting.tuning import tune_candidates
 
-    for r in results:
-        n = r["model_name"]
-        mlflow.log_metric(f"tuned_{primary}_{n}", r["best_value"])
-        mlflow.log_metric(f"tuning_trials_{n}", r["n_trials_completed"])
-        mlflow.log_params({f"best_{n}_{k}": v for k, v in r["best_params"].items()})
+        results = tune_candidates(candidates, df_fc, config)
+        for r in results:
+            n = r["model_name"]
+            mlflow.log_metric(f"tuned_{metric}_{n}", r["best_value"])
+            mlflow.log_metric(f"tuning_trials_{n}", r["n_trials_completed"])
+            mlflow.log_params({f"best_{n}_{k}": v for k, v in r["best_params"].items()})
+        mlflow.log_metric(f"champion_tuned_{metric}", results[0]["best_value"])
+        return results[0]["model_name"], results[0]["best_params"]
 
-    mlflow.log_metric(f"champion_tuned_{primary}", champion["best_value"])
-    return champion
+    if tune_cfg.get("enabled", False):
+        from src.forecasting.tuning import tune_model
+
+        result = tune_model(name, df_fc, config)
+        mlflow.log_metric(f"champion_tuned_{metric}", result["best_value"])
+        mlflow.log_params({f"best_{k}": v for k, v in result["best_params"].items()})
+        return name, result["best_params"]
+    return name, None
 
 
 def _fit_rl_block_forecasts(
     df: pd.DataFrame,
     config: dict,
     periods,
-    ForecasterClass: type,
+    measures: list[Measure],
     model_name: str,
     model_params: dict | None,
-) -> tuple[pd.DataFrame, dict[str, float], Any]:
-    """Out-of-sample forecasts for each RL block (per-block refit when enabled)."""
-    horizons = config["forecasting"]["model"]["horizons"]
+    calibration: dict[str, float],
+) -> tuple[pd.DataFrame, dict[str, float], MeasureForecaster | EnsembleForecaster | None]:
+    """
+    Out-of-sample forecasts for the RL blocks, one forecaster fit per ``periods.block_fits``.
+
+    Each fit uses rows up to its ``fit_end`` and writes forecasts for its own weeks only.
+    The training and validation blocks get a fresh fit every ``refit_every_weeks``; the
+    test block keeps one fit. Scores per block pool that block's fits.
+    """
     feature_cols = get_feature_columns(df)
-    blocks = [
-        ("rl_train", periods.rl_train_start, periods.rl_train_end, periods.fit_end_rl_train),
-        ("rl_val", periods.rl_val_start, periods.rl_val_end, periods.fit_end_rl_val),
-        ("rl_test", periods.rl_test_start, periods.rl_test_end, periods.fit_end_rl_test),
-    ]
-    if not periods.refit_per_block:
-        fit_one = periods.fit_end_rl_train
-        blocks = [(n, s, e, fit_one) for n, s, e, _ in blocks]
-
-    parts: list[pd.DataFrame] = []
-    block_metrics: dict[str, float] = {}
+    parts: dict[str, list[pd.DataFrame]] = {}
     last_forecaster = None
-
-    for name, start, end, fit_end in blocks:
-        train_df = df[df["date"] <= fit_end].copy()
-        pred_df = df[(df["date"] >= start) & (df["date"] <= end)].copy()
+    for fit in periods.block_fits:
+        pred_df = df[(df["date"] >= fit.start) & (df["date"] <= fit.end)]
         if pred_df.empty:
             continue
-        forecaster = ForecasterClass(
-            config, model_name=model_name, model_params=model_params
-        )
-        forecaster.fit(train_df, feature_cols=feature_cols)
+        forecaster = make_forecaster(config, model_name, model_params, measures)
+        forecaster.fit(df[df["date"] <= fit.fit_end], feature_cols=feature_cols)
+        forecaster.calibration = dict(calibration)
         scored = forecaster.predict(pred_df, feature_cols=feature_cols)
-        parts.append(scored)
+        scored["fit_end"] = fit.fit_end
+        parts.setdefault(fit.block, []).append(scored)
         last_forecaster = forecaster
+        print(
+            f"[block fit] {fit.block} {fit.index}: data to {fit.fit_end.date()}, "
+            f"forecasts {fit.start.date()}..{fit.end.date()}",
+            flush=True,
+        )
 
-        for h in horizons:
-            m = forecaster.evaluate_horizon(scored, horizon=h)
-            for k, v in m.items():
-                if isinstance(v, (int, float)) and np.isfinite(float(v)):
-                    block_metrics[f"oos_{name}_{k}_h{h}"] = float(v)
-        if getattr(forecaster, "ltd_enabled", False):
-            m_ltd = forecaster.evaluate_ltd(scored)
-            for k, v in (m_ltd or {}).items():
-                if isinstance(v, (int, float)) and np.isfinite(float(v)):
-                    block_metrics[f"oos_{name}_{k}"] = float(v)
+    block_metrics: dict[str, float] = {}
+    for block, block_parts in parts.items():
+        scored = pd.concat(block_parts, ignore_index=True)
+        for k, v in evaluate_measures(scored, measures).items():
+            block_metrics[f"oos_{block}_{k}"] = v
 
     if not parts:
         return pd.DataFrame(), block_metrics, last_forecaster
-    combined = pd.concat(parts, ignore_index=True)
+    combined = pd.concat([p for block_parts in parts.values() for p in block_parts], ignore_index=True)
     combined = combined.drop_duplicates(subset=["store", "product", "date"], keep="last")
     return combined, block_metrics, last_forecaster
 
@@ -328,26 +303,20 @@ def _keep_previous_forecasts(config: dict) -> None:
 
 
 def run_pipeline(config_path: str | None = None, force: bool = False) -> dict:
-    """Full pipeline: load → features → CV → retrain → save artifacts."""
+    """Full pipeline: load → features → model choice → CV → RL-block forecasts → artifacts."""
     config = load_config(config_path)
     root = Path(config["_project_root"])
 
+    measures = parse_measures(config)
+    primary = primary_measure(config, measures)
+    errors = validate_measures(measures, primary.id)
+    if errors:
+        raise ValueError("; ".join(errors))
+    metric = primary_metric_name(primary)
+
     mlflow_cfg = config["forecasting"]["mlflow"]
     experiment_name = tracking.setup_mlflow(config, "forecasting")
-
-    hash_payload = {
-        "forecasting": {
-            k: v
-            for k, v in config["forecasting"].items()
-            if k not in ("mlflow", "artifacts")
-        },
-        "periods": config.get("periods"),
-        "data": {
-            k: config.get("data", {}).get(k)
-            for k in ("sales_file", "initial_state_date")
-        },
-    }
-    config_hash = tracking.config_hash(hash_payload)
+    config_hash = current_setup_hash(config)
     if mlflow_cfg.get("skip_duplicate_runs", True):
         tracking.check_duplicate_run(experiment_name, config_hash, force=force)
 
@@ -355,33 +324,31 @@ def run_pipeline(config_path: str | None = None, force: bool = False) -> dict:
     if periods.errors:
         raise ValueError("; ".join(periods.errors))
 
-    panel = load_panel_from_config(
-        config, start=periods.data_start, end=periods.data_end
-    )
+    panel = load_panel_from_config(config, start=periods.data_start, end=periods.data_end)
     df = build_feature_matrix(panel, config)
     df_fc = df[df["date"] <= periods.forecaster_cv_end].copy()
-
-    horizons = config["forecasting"]["model"]["horizons"]
     val_cfg = config["forecasting"]["validation"]
-    sel_cfg = config.get("forecasting", {}).get("model_selection", {})
-    tune_cfg = config.get("forecasting", {}).get("tuning", {})
-    forecaster_type = get_forecaster_type(config)
-    primary_metric = get_primary_metric(config)
-    ForecasterClass = get_forecaster_class(config)
+    model_cfg = config["forecasting"]["model"]
+    calibrate = bool(config["forecasting"].get("calibrate_quantiles", False))
 
     with mlflow.start_run(run_name="demand_forecast_pipeline"):
         mlflow.set_tag("config_hash", config_hash)
-
-        # --- params ---
-        run_params = {
-            "forecaster_type": forecaster_type,
-            "primary_metric": primary_metric,
+        mlflow.log_params({
+            "measures": ",".join(m.id for m in measures),
+            "primary_measure": primary.id,
+            "primary_metric": metric,
+            "calibrate_quantiles": calibrate,
+            "target_transform": model_cfg.get("target_transform", "none"),
+            "mean_objective": model_cfg.get("mean_objective", "poisson"),
+            "tweedie_variance_power": model_cfg.get("tweedie_variance_power", 1.5),
+            "demand_profile": bool(
+                config["forecasting"].get("features", {}).get("demand_profile", {}).get("enabled", False)
+            ),
             "n_folds": val_cfg["n_folds"],
             "fold_size_weeks": val_cfg["fold_size_weeks"],
             "gap_weeks": periods.gap_weeks,
             "label_gap_weeks": periods.label_gap_weeks,
             "min_train_size_weeks": val_cfg["min_train_size_weeks"],
-            "horizons": str(horizons),
             "n_features": len(get_feature_columns(df)),
             "n_skus": df.groupby(["store", "product"]).ngroups,
             "n_weeks": df["date"].nunique(),
@@ -392,121 +359,81 @@ def run_pipeline(config_path: str | None = None, force: bool = False) -> dict:
             "rl_val_end": str(periods.rl_val_end.date()),
             "rl_test_start": str(periods.rl_test_start.date()),
             "rl_test_end": str(periods.rl_test_end.date()),
-            "refit_per_block": periods.refit_per_block,
-        }
-        if forecaster_type == "quantile":
-            run_params["quantiles"] = str(config["forecasting"]["model"]["quantiles"])
-            ltd_cfg = config["forecasting"]["model"].get("lead_time_demand", {})
-            if ltd_cfg.get("enabled", False):
-                run_params["ltd_enabled"] = True
-                run_params["ltd_offsets"] = str(ltd_cfg.get("offsets", [0, 1, 2]))
-                run_params["ltd_quantiles"] = str(ltd_cfg.get("quantiles", []))
-        mlflow.log_params(run_params)
+            "refit_every_weeks": periods.refit_every_weeks,
+            "n_block_fits": len(periods.block_fits),
+            "ensemble": ensemble_settings(config)[0],
+            "ensemble_members": ",".join(ensemble_settings(config)[1]) if ensemble_settings(config)[0] else "",
+        })
 
-        # --- Step 1: model selection (optional) ---
-        champion_model_name = "lightgbm"
-        champion_model_params: dict | None = None
+        # --- Steps 1–2: model selection / tuning on the primary measure (optional) ---
+        model_name, model_params = _choose_model(df_fc, config, primary)
+        mlflow.log_param("champion_model", model_name)
 
-        if sel_cfg.get("enabled", False):
-            candidates = _run_model_selection(df_fc, config)
-
-            # --- Step 2: hypertune survivors (optional) ---
-            if tune_cfg.get("enabled", False):
-                champion = _run_tuning(candidates, df_fc, config)
-                champion_model_name = champion["model_name"]
-                champion_model_params = champion["best_params"]
-            else:
-                # Use the best default-param model without tuning
-                champion_model_name = candidates[0][0]
-                champion_model_params = None
-        elif tune_cfg.get("enabled", False):
-            # Tune only the configured (or default) model, skip selection
-            default_model = tune_cfg.get("model", "lightgbm")
-            from src.forecasting.tuning import tune_model
-            result = tune_model(default_model, df_fc, config)
-            champion_model_name = default_model
-            champion_model_params = result["best_params"]
-            mlflow.log_metric(f"champion_tuned_{primary_metric}", result["best_value"])
-            mlflow.log_params(
-                {f"best_{k}": v for k, v in champion_model_params.items()}
-            )
-
-        # Logged once, after every branch has settled on the champion.
-        mlflow.log_param("champion_model", champion_model_name)
-
-        # --- Step 3: full CV with champion ---
+        # --- Step 3: full CV with the champion, every measure ---
         oof, cv_metrics, fold_metrics = run_cross_validation(
-            df_fc,
-            config,
-            model_name=champion_model_name,
-            model_params=champion_model_params,
+            df_fc, config, measures, model_name=model_name, model_params=model_params,
             folds=periods.folds,
         )
-
+        if f"cv_{metric}" in cv_metrics:
+            cv_metrics["cv_primary"] = cv_metrics[f"cv_{metric}"]
         for k, v in cv_metrics.items():
             mlflow.log_metric(k, v)
-
         _log_fold_metrics(fold_metrics)
-        _log_cv_chart(fold_metrics, horizons)
-        _log_oof_sample_chart(oof)
-
+        _log_cv_chart(fold_metrics, metric)
+        _log_oof_sample_chart(oof, measures)
         if fold_metrics:
             tracking.log_dataframe(pd.DataFrame(fold_metrics), artifact_path="cv_detail")
-
         if not oof.empty:
-            log_cv_entity_metrics(oof, config)
+            log_cv_entity_metrics(oof, measures, primary)
+
+        # Conformal shifts come from the CV region only, so RL blocks stay out of sample.
+        calibration: dict[str, float] = {}
+        if calibrate and not oof.empty:
+            transform = config["forecasting"]["model"].get("target_transform", "none")
+            calibration = fit_quantile_shifts(oof, measures, transform)
+            for k, v in calibration.items():
+                mlflow.log_metric(f"calibration_shift_{k}", v)
 
         # --- Step 4: out-of-sample forecasts per RL block ---
         full_scored, block_metrics, forecaster = _fit_rl_block_forecasts(
-            df,
-            config,
-            periods,
-            ForecasterClass,
-            champion_model_name,
-            champion_model_params,
+            df, config, periods, measures, model_name, model_params, calibration
         )
         for k, v in block_metrics.items():
             mlflow.log_metric(k, v)
         for w in periods.warnings:
             mlflow.set_tag(f"warning_{len(w)}", w[:250])
-
         if forecaster is not None:
-            _log_feature_importances(forecaster)
+            _log_feature_importances(forecaster, primary)
 
         # --- Save artifacts ---
         model_dir = root / config["forecasting"]["artifacts"]["model_dir"]
         model_dir.mkdir(parents=True, exist_ok=True)
-        artifact_name = (
-            "mean_forecaster.joblib"
-            if forecaster_type == "mean"
-            else "quantile_forecaster.joblib"
-        )
-        model_path = model_dir / artifact_name
+        model_path = model_dir / "forecaster.joblib"
         if forecaster is not None:
             forecaster.save(model_path)
             mlflow.log_artifact(str(model_path))
 
         forecasts_dir = root / config["forecasting"]["artifacts"]["forecasts_dir"]
         forecasts_dir.mkdir(parents=True, exist_ok=True)
-        forecast_cols = (
-            ["store", "product", "date", "sales"]
-            + [c for c in full_scored.columns if c.startswith(("mu_h", "sigma_h", "pred_q"))]
-        )
+        forecast_cols = ["store", "product", "date", "sales"] + [m.id for m in measures]
         if not full_scored.empty:
             _keep_previous_forecasts(config)
             fc_path = forecasts_dir / "train_forecasts.parquet"
-            full_scored[forecast_cols].to_parquet(fc_path, index=False)
+            # ``fit_end`` records which fit wrote each row, so forecast age can be audited.
+            full_scored[forecast_cols + ["fit_end"]].to_parquet(fc_path, index=False)
             mlflow.log_artifact(str(fc_path), artifact_path="forecasts")
         run = mlflow.active_run()
-        run_id = run.info.run_id if run is not None else None
-        record = build_setup_record(config, periods, run_id=run_id)
-        setup_path = save_setup(config, record)
-        mlflow.log_artifact(str(setup_path), artifact_path="forecasts")
+        record = build_setup_record(
+            config,
+            periods,
+            run_id=run.info.run_id if run is not None else None,
+            extra=manifest_record(measures, primary, calibration),
+        )
+        path = save_setup(config, record)
+        mlflow.log_artifact(str(path), artifact_path="forecasts")
         if not oof.empty:
-            oof_cols = [c for c in forecast_cols if c in oof.columns] + ["fold_id"]
-            oof_export = oof[[c for c in oof_cols if c in oof.columns]]
             oof_path = forecasts_dir / "oof_forecasts.parquet"
-            oof_export.to_parquet(oof_path, index=False)
+            oof[forecast_cols + ["fold_id"]].to_parquet(oof_path, index=False)
             mlflow.log_artifact(str(oof_path), artifact_path="forecasts")
 
         mlflow.log_dict(cv_metrics, "cv_metrics.json")

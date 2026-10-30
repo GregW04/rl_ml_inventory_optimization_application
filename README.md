@@ -1,9 +1,10 @@
 # RL-ML Inventory Optimization
 
-Two-stage inventory optimization for the [VN2 Inventory Planning Challenge](https://www.datasource.ai/en/home/data-science-competitions-for-startups/vn2-inventory-planning-challenge/notebook/37/show):
+VN2-aligned inventory optimization ([VN2 Inventory Planning Challenge](https://supchains.com/vn2-inventory-competition/)):
 
-1. **Demand forecasting** — weekly LightGBM/XGBoost/CatBoost quantile models with calendar, lag, rolling, expanding, and hierarchical (cannibalization) features
-2. **RL simulation** — Gymnasium environment where PPO (continuous) and DQN (discrete) agents use multi-horizon forecast uncertainty to decide order quantities
+1. **Forecasting** — you choose the measures per horizon (h0 = this week, h1 = next week, h2 = delivery week): means, the median or any quantile, via CatBoost/LightGBM/XGBoost or an ensemble of them, refit every n weeks inside the RL training and validation blocks
+2. **Lost-sales anchor** — projects stock under official rules, then orders up to a delivery-week target built from the run's measures (by default the cost-optimal q83)
+3. **RL** — PPO, GRPO or the DQN baseline either corrects the anchor (**residual**) or sets orders from scratch (**raw**), with a state you pick from the run's measures. Trained on train, selected on validation, shipped to test once; costs in **euros (€)**
 
 Everything is wired through a **single MLflow store** and a **Streamlit app** so you can run, browse, and inspect the whole workflow from one place.
 
@@ -20,8 +21,8 @@ pip install -r requirements.txt
 ```
 configs/config.yaml      # single source of truth
 src/forecasting/         # preprocessing, features, validation, model, pipeline
-src/simulation/          # Gymnasium env + reward
-src/rl/                  # PPO / DQN agents + training
+src/simulation/          # VN2 replay engine, lost-sales anchor, RL environment
+src/rl/                  # policy spec, batched replay, PPO / GRPO / DQN training, selection, test scoring
 src/utils/               # metrics, config, and tracking.py (all MLflow access)
 app/                     # Streamlit frontend (Home + 5 pages)
 notebooks/               # EDA and pipeline demos
@@ -37,14 +38,16 @@ data/                    # VN2 competition CSVs
 streamlit run app/Home.py
 ```
 
-One UI to **trigger runs**, **browse & compare** MLflow runs, view **forecasts** (actual
-vs predicted, Q10–Q90 intervals, feature importance), and inspect **inventory/RL** results
-(training curves, fill-rate KPIs, per-SKU order recommendations).
+One UI to **trigger runs**, **browse & compare** MLflow runs, view **forecasts** (actual vs
+each measure per horizon, coverage, feature importance), and inspect **inventory/RL** results
+(training curves, validation vs the anchor, per-SKU order recommendations).
 
-**Run Forecasting** sets periods and features and launches a forecasting run. **Run RL**
-picks a finished forecasting run, shows the split it used, and trains / evaluates agents on
-it. Runs execute in the background (logs in `artifacts/app_jobs/`), so you can switch pages
-while they work.
+**Run Forecasting** sets periods, features and the measures to forecast, then launches a run.
+**Run RL** picks a finished forecasting run, shows its frozen split and measures, and lets you
+choose the method (residual or raw), the state features and the seeds. It then shows the
+validation leaderboard and scores the champion once on the test block (locked afterwards).
+Runs execute in the background (logs in `artifacts/app_jobs/`), so you can switch pages while
+they work. Set `VN2_CONFIG=<path>` to point the app at another base config.
 
 ### Option B — the CLI
 
@@ -52,10 +55,11 @@ while they work.
 # Demand forecasting
 python -m src.forecasting.pipeline --config configs/config.yaml
 
-# RL training on the latest forecasting run (its periods + forecasts),
-# or on a specific one with --forecast-run <run_id>
-python -m src.rl.train --config configs/config.yaml --agent ppo
-python -m src.rl.train --config configs/config.yaml --agent dqn --forecast-run <run_id>
+# RL: a policy spec (JSON, see src/rl/spec.py; the app writes one for you) fixes the
+# forecasting run, method, agent, state and anchor. One MLflow run per seed.
+python -m src.rl.train --config configs/config.yaml --spec spec.json --seeds 42 43 44
+
+# Score the validation champion once on the test block (locked afterwards)
 python -m src.rl.evaluate --config configs/config.yaml --forecast-run <run_id>
 ```
 
@@ -84,10 +88,16 @@ Experiments: `vn2-demand-forecasting` and `vn2-inventory-rl`. See
 
 - **Frequency**: weekly (ISO week starts, Mondays in the data)
 - **OOS masking**: `InStock=False` → `sales=NaN` (censored demand)
-- **Periods**: configure train / validation / test RL blocks and forecaster CV in the app; forecasts are fit out-of-sample per block (see `forecast_setup.json`)
+- **Periods**: configure train / validation / test RL blocks and forecaster CV in the app. Forecasts for the RL blocks are out of sample: `periods.refit_every_weeks` (n, default 13; 0 = one fit per block) refits the forecaster every n weeks inside the training and validation blocks, each fit using rows up to three weeks before the weeks it forecasts. The test block keeps one fit made before its first week, so the VN2 window only uses labels known by week 0. The Run Forecasting page previews the fits as lanes and the forecast age at each order decision; `forecast_setup.json` saves them as `block_fits`, and the forecasts parquet records each row's `fit_end`
 - **Validation**: expanding-window CV. Before each scored block the training fit stops for an embargo equal to the forecast horizon, so a training label cannot reach into the scored weeks. Backward lags (including 51–53) use earlier sales only and do not widen that embargo. Lag and rolling features use sales through *t−1*; seasonal lags use *t−51* through *t−53*.
-- **Forecasts**: Q10/Q50/Q90 per horizon h ∈ {0, 1, 2} → μ = Q50, σ ≈ (Q90−Q10)/2.56
-- **RL reward**: `R_t = −0.2·leftover_t − 1.0·shortage_t`
+- **Demand profile** (`forecasting.features.demand_profile`, off by default): each SKU's profile from the trailing 52 weeks ending at *t−1*: ADI and CV² of non-zero sales, zero share, level, volume percentile on the date, weeks since the last sale, its demand pattern (Syntetos–Boylan–Croston: smooth / erratic / intermittent / lumpy) and its volume tier (`dp_volume_tier`: 0 = the SKUs holding the first 80% of the date's volume, 1 = the next 15%, 2 = the rest). Out-of-stock weeks are skipped, not counted as zero demand; cutoffs are fixed, so nothing is fitted and the features are point-in-time
+- **Forecast measures**: `forecasting.measures` lists what to predict per horizon. A mean is a Poisson booster on demand, or a Tweedie one with `forecasting.model.mean_objective: tweedie` (variance ∝ mean^p, `tweedie_variance_power` p in (1, 2), for zero-heavy, overdispersed demand). A quantile is a pinball booster in log1p space, and the quantiles of a horizon are sorted so they never cross. Ids double as column names and RL state features: `mean_h0`, `q50_h1`, `q83_h2`. `primary_measure` (pinball for a quantile, RMSE for a mean) drives model selection and tuning. With `calibrate_quantiles`, each quantile gets a split-conformal shift fitted on the CV region's out-of-fold data. Each run saves its measures in `forecast_setup.json`. With `forecasting.ensemble.enabled`, every fit (CV and RL blocks) trains each member backend (default CatBoost and LightGBM) and averages their forecasts; calibration is applied once after averaging, model selection is skipped and tuning tunes each member
+- **Anchor**: `end_k = max(0, on_hand + arrive_k − d_h0)`, `y = max(0, end_k + arrive_k1 − d_h1)`, `order = max(0, round(target_h2 − y))`. `d_h0` and `d_h1` are each horizon's mean (else its median). The target is a quantile at the critical ratio, else the Poisson quantile of the mean
+- **RL methods**: residual `order = max(0, round(anchor + f·max(anchor, floor·scale)))`, where f = 0 is the anchor; raw `order = round(f·k·scale)`, f ∈ [0, 1], where scale is the SKU's peak weekly training sales. The state is the inventory pipeline plus any of the run's measures, anchor-derived and context features, and optionally the demand class (one-hot Smooth / Erratic / Intermittent / Lumpy). The spec is saved with each run, so evaluation always rebuilds the same observation layout
+- **RL agents**: **PPO** and **GRPO** train on a batched replay of the training windows (`src/rl/batch_env.py`, an exact twin of the evaluation environment). The residual policy starts exactly at the anchor; each iteration replays thousands of windows; PPO's reward is paired with a shadow anchor on the same demand; GRPO (Group Relative Policy Optimization) replays every sampled window `group_size` times and judges each rollout against its group, with a KL penalty to the starting policy. Costs stay in euros. **DQN** is the Stable-Baselines3 baseline over discrete residual buckets
+- **RL protocol**: each seed is fit on the `rl_train` windows for its full budget (DQN timesteps, PPO / GRPO iterations), and its final weights are kept. A learning curve (cost against the anchor on 2,000 fixed training windows) is logged for display only. It is scored once on `rl_val` next to the anchor. The leaderboard ranks configurations by mean validation cost over seeds, with a paired bootstrap CI vs the anchor and the change per demand class; the anchor is a candidate too. The champion ships its project-seed weights. `rl_test` is scored once per forecasting run; a second score needs an explicit override and is tagged `post_hoc`
+- **Evaluation (€)**: VN2-shaped 8-week windows, 6 orders, cost of weeks 3–8 (0.2 €/unit left, 1 € per lost sale). The official window (2024-04-15 … 2024-06-03) from the official start state gives the VN2 score; the app shows a compliance badge
+- **Citation**: Vandeput, N. (2025), *VN2 Inventory Planning Challenge*, https://supchains.com/vn2-inventory-competition/
 
 ## Data
 

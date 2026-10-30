@@ -130,34 +130,16 @@ def build_target_columns(
     return df
 
 
-def build_lead_time_target_column(
-    panel: pd.DataFrame,
-    offsets: list[int],
-    target_col: str = "sales",
-    name: str = "target_S",
-) -> pd.DataFrame:
-    """
-    Add protection-period demand target: sum of sales at t+offset for each offset.
-
-    Any NaN week in the window makes the sum NaN (same OOS masking as weekly targets).
-    """
-    df = panel.copy()
-    g = df.groupby(["store", "product"], observed=True)[target_col]
-    parts = [g.shift(-o) for o in offsets]
-    df[name] = sum(parts)
-    return df
-
-
 def load_panel_from_config(
     config: dict | None = None,
     start: str | pd.Timestamp | None = None,
     end: str | pd.Timestamp | None = None,
 ) -> pd.DataFrame:
     """Convenience loader using project config; optional inclusive date filter."""
+    from src.forecasting.measures import HORIZONS
+
     cfg = config or load_config()
     data_cfg = cfg["data"]
-    model_cfg = cfg["forecasting"]["model"]
-    horizons = model_cfg["horizons"]
 
     panel = load_sales_panel(
         sales_path=data_cfg["sales_file"],
@@ -170,11 +152,4 @@ def load_panel_from_config(
         panel = panel[panel["date"] >= pd.Timestamp(start)]
     if end is not None:
         panel = panel[panel["date"] <= pd.Timestamp(end)]
-    panel = build_target_columns(panel, horizons=horizons)
-
-    ltd_cfg = model_cfg.get("lead_time_demand", {})
-    if ltd_cfg.get("enabled", False):
-        offsets = ltd_cfg.get("offsets", [0, 1, 2])
-        panel = build_lead_time_target_column(panel, offsets=offsets)
-
-    return panel
+    return build_target_columns(panel, horizons=list(HORIZONS))

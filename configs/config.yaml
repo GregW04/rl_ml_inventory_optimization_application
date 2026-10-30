@@ -5,9 +5,17 @@ project:
   seed: 42
   frequency: W  # weekly (ISO week, Monday-aligned in VN2 data)
 
+vn2:
+  holding_cost: 0.2
+  shortage_cost: 1.0
+  lead_time_weeks: 2
+  n_order_rounds: 6
+  window_weeks: 8
+  score_from_week: 3
+
 data:
   data_dir: data
-  sales_file: Week8-2024-06-03-Sales.csv  # widest historical panel
+  sales_file: Week8-2024-06-03-Sales.csv
   instock_file: Week0-InStock.csv
   master_file: Week0-Master.csv
   initial_state_file: Week0-2024-04-08-Initial State.csv
@@ -20,18 +28,18 @@ data:
   instock_col: in_stock
 
 forecasting:
-  forecaster_type: quantile   # "quantile" (uncertainty → RL sigma signal) or "mean" (point forecast)
   features:
     calendar:
       enabled: true
       cyclical_encoding: true
-      fourier_harmonics: 3  # week-of-year sine/cosine pairs; 1 keeps the base names
+      fourier_harmonics: 3
     holidays:
       enabled: true
       events:
         - new_year
         - easter
         - halloween
+        - november_promo
         - black_friday
         - christmas
         - summer_peak
@@ -40,11 +48,21 @@ forecasting:
     lags:
       enabled: true
       momentum: true
-      lags: [1, 2, 4, 8, 13, 51, 52, 53]  # 51–53 = same weeks last year; backward only
+      lags: [1, 2, 4, 8, 13, 51, 52, 53]
       rolling_windows: [4, 8, 13]
       rolling_aggs: [mean, std, min, max, median]
       expanding_aggs: [mean, std, min, max]
       expanding_min_periods: 4
+    # Each SKU's demand profile from the trailing window ending last week: intermittency
+    # (ADI, CV² of non-zero sales), level, its demand pattern (smooth, erratic, intermittent,
+    # lumpy) and its volume tier.
+    demand_profile:
+      enabled: false
+      window_weeks: 52
+      min_periods: 13
+      adi_cutoff: 1.32
+      cv2_cutoff: 0.49
+      volume_cutoffs: [0.8, 0.95]
     hierarchical:
       enabled: true
       group_levels:
@@ -61,26 +79,26 @@ forecasting:
     fold_size_weeks: 13
     min_train_size_weeks: 52
 
+  # What the forecaster predicts per horizon (h0 = this week, h1 = next week,
+  # h2 = delivery week). kind: mean | std | quantile; quantile tau is a level in
+  # (0, 1) or critical_ratio (= shortage / (shortage + holding) = 0.8333).
+  measures:
+    - {kind: mean, horizon: 0}
+    - {kind: mean, horizon: 1}
+    - {kind: quantile, horizon: 2, tau: 0.5}
+    - {kind: quantile, horizon: 2, tau: critical_ratio}
+  # Measure whose proper score (pinball / RMSE) drives model selection and tuning.
+  primary_measure: q83_h2
+  # Split-conformal shift of each quantile on out-of-fold data (CV region only).
+  calibrate_quantiles: false
+
   model:
-    horizons: [0, 1, 2]
-    quantiles: [0.1, 0.5, 0.9]
-    lead_time_demand:
-      enabled: true
-      offsets: [0, 1, 2]   # S_t = sum of sales at t + offsets (protection period)
-      quantiles: [0.5, 0.83, 0.9, 0.95]  # 0.83 = Cs/(Cs+Ch) critical ratio
-    target_transform: log1p  # fit quantiles in log space (handles right-skew/spikes)
-    sample_weight: null  # demand-weighting backfired with log1p (extrapolation blow-ups); off
-    sigma_divisor: 2.56  # normal approx: (Q90 - Q10) / 2.56 ≈ sigma
-    lightgbm:
-      num_leaves: 31
-      learning_rate: 0.05
-      n_estimators: 500
-      subsample: 0.8
-      colsample_bytree: 0.8
-      min_child_samples: 20
-      reg_alpha: 0.1
-      reg_lambda: 0.1
-      verbose: -1
+    name: catboost
+    target_transform: log1p
+    # Loss of the mean boosters: poisson, or tweedie (variance ∝ mean^p, p in (1, 2)) for
+    # zero-heavy, overdispersed demand.
+    mean_objective: poisson
+    tweedie_variance_power: 1.5
     categorical_features:
       - store
       - product
@@ -91,26 +109,33 @@ forecasting:
       - store_format
       - format
       - week_of_year
+      - dp_sbc_class
+      - dp_volume_tier
 
-  # M2 Air (8 cores): 4 fits at once × 2 threads each. Raise tuning.n_jobs only if n_jobs is 1.
   compute:
     n_jobs: 4
     booster_threads: 2
 
+  # Average several backends at every fit (CV and RL blocks). Replaces model selection;
+  # tuning, if on, tunes each member separately.
+  ensemble:
+    enabled: false
+    members: [catboost, lightgbm]
+
   model_selection:
     enabled: false
     candidates: [lightgbm, xgboost, catboost]
-    n_candidates_to_tune: 1       # keep top-K after selection, tune all survivors
-    elimination_threshold: 0.40   # drop models >40% worse than best on defaults
+    n_candidates_to_tune: 1
+    elimination_threshold: 0.40
 
   tuning:
     enabled: false
-    n_jobs: 1             # parallel Optuna trials (keep 1 while compute.n_jobs > 1)
+    n_jobs: 1
     n_trials: 50
-    n_cv_folds: 5         # most-recent folds used per Optuna trial (1 = fast)
-    timeout_seconds: null # wall-clock cap in seconds (null = no cap)
+    n_cv_folds: 5
+    timeout_seconds: null
     seed: 42
-    n_trials_no_improve: 10      # stop if best hasn't improved for this many trials
+    n_trials_no_improve: 10
     early_stopping_min_delta: 0.0001
 
   mlflow:
@@ -125,52 +150,77 @@ forecasting:
 periods:
   data_start: null
   end: null
-  rl_test_weeks: 9
+  rl_test_weeks: 8
   rl_val_weeks: 8
   rl_train_weeks: 26
-  refit_per_block: true
+  # Refit the forecaster every n weeks inside the RL training and validation blocks
+  # (0 = one fit per block). The test block keeps one fit made before its first week.
+  refit_every_weeks: 13
 
 rl:
-  forecast_run_id: null  # forecasting run whose periods + forecasts RL uses (null = latest on disk)
-  environment:
-    holding_cost: 0.2
-    shortage_cost: 1.0
-    lead_time_weeks: 2  # order placed at t arrives in full at t+lead_time_weeks
-    max_order: 50.0           # default cap for a standalone env when no per-SKU cap given
-    order_cap_mult: 1.0       # per-SKU cap = mult * that SKU's peak historical weekly sales
-    min_order_cap: 1.0        # avoid a degenerate zero cap for never-sold SKUs
-    normalize_action: true    # (ignored when residual_mode) action as fraction of cap
-    scale_obs_by_cap: true    # on-hand, pipeline, and weekly quantiles in units of the SKU cap
-    per_sku_reward_norm: false # OFF: equal-weighting de-prioritized high-volume SKUs (67% of cost) and hurt the real objective
-    residual_mode: true      # direct RL: agent emits the order fraction itself (classic PPO/DQN)
-    residual_floor_frac: 0.25 # min correction scale = frac * order_cap (used only when residual_mode)
-    ltd_base_stock_quantile: 0.83  # order-up-to quantile of lead-time demand S_t
+  # Seeds trained per configuration; project.seed must be among them (its weights ship).
+  seeds: [42, 43, 44]
+  methods:
+    # Correction on the lost-sales anchor: order = anchor + f · max(anchor, floor_frac · scale).
+    residual:
+      floor_frac: 0.25
+      dqn_buckets: [-1.0, -0.5, -0.25, -0.1, -0.05, -0.02, 0.0, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0]
+    # From scratch: order = f · order_cap_mult · scale, f in [0, 1]; finer buckets near 0.
+    raw:
+      order_cap_mult: 1.0
+      dqn_buckets: [0.0, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.65, 0.8, 1.0]
 
   agents:
+    # PPO and GRPO train on the batched replay of the training windows (src/rl/batch_env.py).
+    # The residual policy starts exactly at the anchor; the budget is in iterations, each one
+    # replays ``batch_windows`` windows (GRPO: ``batch_windows`` × ``group_size`` rollouts).
     ppo:
-      policy: MlpPolicy
+      iterations: 300
+      batch_windows: 2048
+      epochs: 4
+      minibatch_size: 4096
       learning_rate: 0.0003
-      n_steps: 2048
-      batch_size: 64
-      gamma: 0.99
-      ent_coef: 0.05
-      total_timesteps: 10000000  # longer run
+      gamma: 1.0
+      gae_lambda: 0.95
+      clip_range: 0.2
+      vf_coef: 0.5
+      ent_coef: 0.0
+      init_log_std: -2.3
+      hidden: [64, 64]
+      max_grad_norm: 0.5
+      # Reward = anchor's cost minus the policy's cost on the same window (same optimum,
+      # far less noise than the raw cost).
+      paired_reward: true
+
+    grpo:
+      iterations: 300
+      batch_windows: 256
+      group_size: 16
+      epochs: 4
+      minibatch_size: 4096
+      learning_rate: 0.0003
+      clip_range: 0.2
+      kl_coef: 0.02
+      init_log_std: -2.3
+      hidden: [64, 64]
+      max_grad_norm: 0.5
+      # batch: advantages keep their euro weight (one batch-wide scale); group: divide by
+      # each group's spread (textbook GRPO, weights every window equally).
+      advantage_scale: batch
 
     dqn:
-      # 8-bucket set that produced the best DQN (-12.14); 17-bucket grids only regressed.
-      # Fine at the low end to trim holding cost, broad higher up.
-      order_buckets: [0.0, 0.02, 0.05, 0.1, 0.2, 0.35, 0.6, 1.0]
-      # residual_mode: signed corrections on base-stock (fractions of the residual scale)
-      residual_buckets: [-1.0, -0.5, -0.25, -0.1, -0.05, -0.02, 0.0, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0]
       learning_rate: 0.0001
       buffer_size: 50000
       learning_starts: 1000
       batch_size: 64
       gamma: 0.99
-      exploration_fraction: 0.4    # decay epsilon over 40% of training (was 0.1)
-      exploration_final_eps: 0.10  # keep 10% random actions (was 0.05)
-      total_timesteps: 1000000
+      exploration_fraction: 0.4
+      exploration_final_eps: 0.10
+      total_timesteps: 500000
 
   mlflow:
     experiment_name: vn2-inventory-rl
     tracking_uri: sqlite:///mlruns.db
+
+  artifacts:
+    runs_dir: artifacts/rl/runs

@@ -8,7 +8,8 @@ Design rationale
 - The top ``n_candidates_to_tune`` survivors are passed to hypertuning.
 - We do *not* cut to top-1 here — even a model 15 % worse on defaults
   can win after tuning (XGBoost defaults are notoriously conservative).
-- Primary metric: wQL for ``forecaster_type: quantile``, MAE for ``mean``.
+- Metric: the primary measure's proper score (pinball for a quantile, RMSE for a
+  mean). Only that measure's booster is fitted, so selection stays fast.
 """
 
 from __future__ import annotations
@@ -18,7 +19,9 @@ import logging
 import numpy as np
 import pandas as pd
 
-from src.forecasting.model import get_feature_columns, get_forecaster_class, get_primary_metric
+from src.forecasting.forecaster import MeasureForecaster
+from src.forecasting.measures import primary_measure, primary_metric_name
+from src.forecasting.model import get_feature_columns
 from src.forecasting.registry import available_candidates
 from src.forecasting.validation import get_unique_dates, make_folds
 
@@ -32,21 +35,12 @@ def _score_candidate(
     config: dict,
     feature_cols: list[str],
 ) -> float:
-    """Train candidate on one fold; return mean primary metric across horizons."""
-    ForecasterClass = get_forecaster_class(config)
-    primary = get_primary_metric(config)
-
-    forecaster = ForecasterClass(config, model_name=model_name)
+    """Train the primary measure's booster on one fold; return its primary metric."""
+    primary = primary_measure(config)
+    forecaster = MeasureForecaster(config, model_name=model_name, measures=[primary])
     forecaster.fit(train_df, feature_cols=feature_cols)
     scored = forecaster.predict(val_df, feature_cols=feature_cols)
-
-    scores = []
-    for h in config["forecasting"]["model"]["horizons"]:
-        m = forecaster.evaluate_horizon(scored, horizon=h)
-        if primary in m and np.isfinite(m[primary]):
-            scores.append(m[primary])
-
-    return float(np.mean(scores)) if scores else np.nan
+    return float(forecaster.evaluate(scored).get(primary_metric_name(primary), np.nan))
 
 
 def select_candidates(
@@ -70,7 +64,7 @@ def select_candidates(
     elimination_threshold = sel_cfg.get(
         "elimination_threshold", elimination_threshold
     )
-    primary = get_primary_metric(config)
+    primary = primary_metric_name(primary_measure(config))
 
     importable = available_candidates(candidates)
     if not importable:

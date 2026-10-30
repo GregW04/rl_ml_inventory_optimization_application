@@ -5,6 +5,9 @@ Domain logic stays in ``src/``; this module only adds Streamlit-specific concern
 locating the project root, caching config / MLflow queries, building override configs
 for triggered runs, running pipelines as background jobs, and the shared split view.
 
+``VN2_CONFIG`` (an environment variable) points the app at another base config, e.g. a
+scratch config whose tracking store and artifact folders are isolated for smoke tests.
+
 All MLflow access goes through :mod:`src.utils.tracking` — the app never imports ``mlflow``.
 """
 
@@ -36,15 +39,22 @@ def _find_root() -> Path:
 ROOT = _find_root()
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+CONFIG_PATH = Path(os.environ.get("VN2_CONFIG") or ROOT / "configs" / "config.yaml")
 
+from src.forecasting.measures import Measure, run_measures  # noqa: E402
 from src.forecasting.periods import (  # noqa: E402
+    BLOCK_NAMES,
+    block_fit_counts,
+    decision_ages,
     fetch_run_file,
     load_run_setup,
+    mean_decision_age,
     panel_weeks,
     resolve_periods,
 )
 from src.utils import tracking  # noqa: E402
 from src.utils.config import load_config  # noqa: E402
+from src.simulation.vn2 import check_vn2_compliance  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +64,7 @@ from src.utils.config import load_config  # noqa: E402
 @st.cache_resource
 def get_config() -> dict:
     """Load and cache the project config once per session."""
-    return load_config(str(ROOT / "configs" / "config.yaml"))
+    return load_config(str(CONFIG_PATH))
 
 
 def init_tracking() -> str:
@@ -80,7 +90,7 @@ def cached_runs(experiment_name: str):
 
 def merged_config(updates: dict) -> dict:
     """Base config + nested updates (not written to disk)."""
-    base = load_config(str(ROOT / "configs" / "config.yaml"))
+    base = load_config(str(CONFIG_PATH))
     _deep_update(base, updates)
     return base
 
@@ -90,23 +100,16 @@ def resolve_from_config_dict(cfg: dict):
     return resolve_periods(cfg, weeks)
 
 
-def forecasts_path() -> Path:
-    cfg = get_config()
-    return (
-        ROOT
-        / cfg["forecasting"]["artifacts"]["forecasts_dir"]
-        / "train_forecasts.parquet"
-    )
-
-
-def rl_model_path(agent: str) -> Path:
-    return ROOT / "artifacts" / "rl" / f"{agent}_inventory.zip"
-
-
-def agent_meta(agent: str) -> dict:
-    """Sidecar written by RL training: the forecasting run the saved agent was trained on."""
-    path = rl_model_path(agent).with_suffix(".json")
-    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+def vn2_compliance_badge(cfg: dict | None = None) -> tuple[bool, list[str]]:
+    """Green/red VN2 comparability from config and resolved periods."""
+    cfg = cfg or get_config()
+    periods = resolve_from_config_dict(cfg)
+    resolved = {
+        "rl_test_start": str(periods.rl_test_start.date()),
+        "rl_test_end": str(periods.rl_test_end.date()),
+    }
+    comp = check_vn2_compliance(cfg, resolved)
+    return comp.ok, comp.messages
 
 
 # ---------------------------------------------------------------------------
@@ -147,23 +150,110 @@ def run_has_forecasts(run_id: str) -> bool:
     return fetch_run_file(get_config(), run_id, "train_forecasts.parquet") is not None
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def measures_of_run(run_id: str) -> list[dict]:
+    """Measures of a forecasting run (manifest, or inferred for runs saved before manifests)."""
+    init_tracking()
+    return [m.to_dict() for m in run_measures(get_config(), run_id)]
+
+
+def as_measures(rows: list[dict]) -> list[Measure]:
+    return [Measure.from_dict(d) for d in rows]
+
+
+def forecast_run_label(r: pd.Series) -> str:
+    """Start time, short id and the run's primary CV score."""
+    started = r["start_time"].to_pydatetime().astimezone()
+    score = ""
+    metric = r.get("params.primary_metric")
+    value = r.get("metrics.cv_primary")
+    if isinstance(metric, str) and pd.notna(value):
+        score = f" · {metric} {value:.3f}"
+    elif pd.notna(r.get("metrics.cv_pinball_q83_h2_mean")):
+        score = f" · pinball_q83_h2 {r['metrics.cv_pinball_q83_h2_mean']:.3f}"
+    return f"{started:%Y-%m-%d %H:%M} · {r['run_id'][:8]}{score}"
+
+
+# ---------------------------------------------------------------------------
+# RL runs, leaderboard and the test lock
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=15, show_spinner=False)
+def rl_leaderboard(forecast_run_id: str) -> pd.DataFrame:
+    """Validation leaderboard (configurations + anchor) for a forecasting run."""
+    from src.rl.selection import leaderboard
+
+    init_tracking()
+    return leaderboard(get_config(), forecast_run_id)
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def test_scores(forecast_run_id: str) -> pd.DataFrame:
+    """Finished test scorings of a forecasting run, newest first (empty = not yet scored)."""
+    from src.rl.evaluate import scored_test_runs
+
+    init_tracking()
+    return scored_test_runs(get_config(), forecast_run_id)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def legacy_test_count(forecast_run_id: str) -> int:
+    """How often the test block was evaluated before the lock existed."""
+    from src.rl.evaluate import legacy_test_runs
+
+    init_tracking()
+    return len(legacy_test_runs(get_config(), forecast_run_id))
+
+
+def rl_train_runs(forecast_run_id: str | None = None) -> pd.DataFrame:
+    """Finished training runs (``stage=train``), optionally for one forecasting run."""
+    runs = cached_runs(experiment_names()["rl"])
+    if runs.empty or "tags.stage" not in runs:
+        return pd.DataFrame()
+    keep = (runs["tags.stage"] == "train") & (runs["status"] == "FINISHED")
+    if forecast_run_id:
+        keep &= runs.get("tags.forecast_run_id") == forecast_run_id
+    return runs[keep]
+
+
 # ---------------------------------------------------------------------------
 # Split view (live on the Forecasting page, frozen on RL / Experiments)
 # ---------------------------------------------------------------------------
 
 _SEGMENT_COLORS = {
-    "Feature warm-up": "#EECA3B",
     "Embargo": "#EECA3B",
     "CV fit region": "#4C78A8",
     "Label gap": "#9D9D9D",
     "Train": "#F58518",
+    "Validation (selection)": "#54A24B",
+    "Test (production)": "#E45756",
+    "Fit": "#72B7B2",
+    "Forecasts written": "#9ECAE9",
+    "Validation": "#B279A2",
+    # Labels saved by runs before the rename.
     "Validation (checkpoint)": "#54A24B",
     "Test (final score)": "#E45756",
-    "Fit": "#72B7B2",
-    "Gap": "#BAB0AC",
-    "Validation": "#B279A2",
 }
-_LANE_RANK = {"Features": 0, "Forecaster": 1, "RL": 3}
+_BLOCK_ORDER = {name: i for i, name in enumerate(BLOCK_NAMES.values())}
+_BLOCK_COLORS = {"training": "#F58518", "validation": "#54A24B", "test": "#E45756"}
+
+
+def _lane_key(lane: str) -> tuple:
+    """Forecaster, CV folds, block fits (training, validation, test), then RL."""
+    if lane == "Features":
+        return (0, 0, 0, lane)
+    if lane == "Forecaster":
+        return (1, 0, 0, lane)
+    if lane.startswith("CV fold"):
+        tail = lane.rsplit(" ", 1)[-1]
+        return (2, int(tail) if tail.isdigit() else 0, 0, lane)
+    if lane.startswith("Fit · "):
+        rest = lane[len("Fit · "):].split(" ")
+        idx = int(rest[1].split("/")[0]) if len(rest) > 1 and rest[1].split("/")[0].isdigit() else 1
+        return (3, _BLOCK_ORDER.get(rest[0], 9), idx, lane)
+    if lane == "RL":
+        return (4, 0, 0, lane)
+    return (5, 0, 0, lane)
 
 
 def timeline_chart(segments_df):
@@ -175,7 +265,7 @@ def timeline_chart(segments_df):
     df = segments_df.copy()
     df["start"] = pd.to_datetime(df["start"])
     df["end"] = pd.to_datetime(df["end"]) + pd.Timedelta(days=6)
-    lanes = sorted(df["lane"].unique(), key=lambda lane: (_LANE_RANK.get(lane, 2), lane))
+    lanes = sorted(df["lane"].unique(), key=_lane_key)
     present = [p for p in _SEGMENT_COLORS if p in set(df["part"])]
     color_scale = alt.Scale(domain=present, range=[_SEGMENT_COLORS[p] for p in present])
     chart = (
@@ -198,11 +288,20 @@ def _weeks_between(start, end) -> int | None:
     return None if pd.isna(s) or pd.isna(e) else (e - s).days // 7 + 1
 
 
+def _fit_ends(resolved: dict, block: str, fallback_key: str) -> str:
+    """'2023-01-30' for one fit, '2023-01-30 … 2023-10-30' for several."""
+    ends = [f["fit_end"] for f in (resolved.get("block_fits") or []) if f.get("block") == block]
+    if not ends:
+        return resolved.get(fallback_key, "—")
+    return ends[0] if len(ends) == 1 else f"{ends[0]} … {ends[-1]}"
+
+
 def render_split_view(segments: pd.DataFrame, resolved: dict) -> None:
     """Timeline chart plus block table, from live periods or a saved setup record."""
     chart = timeline_chart(segments)
     if chart is not None:
         st.altair_chart(chart, width="stretch")
+    counts = block_fit_counts(resolved)
     blocks = [
         ("Forecaster CV region", "forecaster_cv", None),
         ("RL train", "rl_train", "fit_end_rl_train"),
@@ -215,12 +314,79 @@ def render_split_view(segments: pd.DataFrame, resolved: dict) -> None:
             "Start": resolved.get(f"{key}_start"),
             "End": resolved.get(f"{key}_end"),
             "Weeks": _weeks_between(resolved.get(f"{key}_start"), resolved.get(f"{key}_end")),
-            "Forecasts from a fit through": resolved.get(fit, "—") if fit else "—",
+            "Forecaster fits": str(counts.get(key, 1)) if fit else "—",
+            "Forecasts from fits through": _fit_ends(resolved, key, fit) if fit else "—",
         }
         for name, key, fit in blocks
         if resolved.get(f"{key}_start")
     ]
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+
+def refit_summary(resolved: dict) -> str:
+    """One line on a run's refit cadence, for saved records (old ones: one fit per block)."""
+    n = resolved.get("refit_every_weeks")
+    counts = block_fit_counts(resolved)
+    if n:
+        return (
+            f"forecaster refit every **{n}** weeks in training and validation "
+            f"({counts['rl_train']} + {counts['rl_val']} fits; test {counts['rl_test']})"
+        )
+    return "one forecaster fit per block"
+
+
+def render_refit_preview(periods, n_members: int = 1) -> None:
+    """Fit counts and mean forecast age per block for live (unsaved) periods."""
+    fits = periods.block_fits
+    by_block = {b: sum(1 for f in fits if f.block == b) for b in BLOCK_NAMES}
+    total = len(periods.folds) + len(fits)
+    ages = decision_ages(periods)
+    mean_age = mean_decision_age(ages) if not ages.empty else {}
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric(
+        "Forecaster fits", total,
+        help=f"{len(periods.folds)} CV folds + {len(fits)} RL-block fits"
+        + (f"; each fit trains {n_members} backends (ensemble)" if n_members > 1 else ""),
+    )
+    c2.metric("Fits in training block", by_block["rl_train"])
+    c3.metric("Forecast age, training", f"{mean_age.get('rl_train', float('nan')):.1f} wk")
+    c4.metric(
+        "Forecast age, val / test",
+        f"{mean_age.get('rl_val', float('nan')):.1f} / {mean_age.get('rl_test', float('nan')):.1f} wk",
+    )
+    model_fits = total * n_members
+    st.caption(
+        f"{by_block['rl_train']} training + {by_block['rl_val']} validation + {by_block['rl_test']} test "
+        f"block fits and {len(periods.folds)} CV folds"
+        + (f", {model_fits} backend fits with the ensemble" if n_members > 1 else "")
+        + ". Forecast age is the number of weeks between a fit's last data week and the "
+        "Monday an order is decided, averaged over every order decision the agent sees."
+    )
+
+
+def age_chart(periods):
+    """Altair bars: forecaster age at each decision Monday, coloured by block."""
+    import altair as alt
+
+    ages = decision_ages(periods)
+    if ages.empty:
+        return None
+    df = ages.assign(block=ages["block"].map(BLOCK_NAMES))
+    present = [b for b in _BLOCK_COLORS if b in set(df["block"])]
+    return (
+        alt.Chart(df)
+        .mark_bar()
+        .encode(
+            x=alt.X("date:T", title="Decision Monday"),
+            y=alt.Y("age_weeks:Q", title="Forecaster age (weeks)"),
+            color=alt.Color(
+                "block:N", title="Block",
+                scale=alt.Scale(domain=present, range=[_BLOCK_COLORS[b] for b in present]),
+            ),
+            tooltip=["block", "date:T", "age_weeks", "fit", "windows"],
+        )
+        .properties(height=200, width="container")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +404,7 @@ def _deep_update(base: dict, updates: dict) -> dict:
 
 def build_override_config(updates: dict) -> str:
     """Write a temp config = base config + nested ``updates``; return its path."""
-    with open(ROOT / "configs" / "config.yaml", encoding="utf-8") as f:
+    with open(CONFIG_PATH, encoding="utf-8") as f:
         base = yaml.safe_load(f)
     _deep_update(base, updates)
     fd, path = tempfile.mkstemp(suffix=".yaml", prefix="cfg_override_")
@@ -337,6 +503,8 @@ def job_panel(kind: str) -> dict | None:
             st.caption(f"Full log: `{j['log']}`")
         if job["running"] and not j["running"]:
             cached_runs.clear()
+            rl_leaderboard.clear()
+            test_scores.clear()
             st.rerun()
 
     _panel()

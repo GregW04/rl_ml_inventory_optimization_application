@@ -8,11 +8,12 @@ from typing import Any, Callable
 
 @dataclass
 class ModelSpec:
-    """Specification for a candidate regression model (quantile or mean)."""
+    """A boosting backend: quantile, Poisson and Tweedie (count-mean) estimators, plus its search space."""
 
     name: str
-    make_estimator: Callable[[float, dict], Any]  # (quantile, params) -> estimator
-    make_mean_estimator: Callable[[dict], Any]  # params -> MSE point-forecast estimator
+    make_quantile_estimator: Callable[[float, dict], Any]  # (quantile, params) -> estimator
+    make_poisson_estimator: Callable[[dict], Any]  # params -> count-mean estimator
+    make_tweedie_estimator: Callable[[float, dict], Any]  # (variance power, params) -> count-mean estimator
     default_params: dict
     # search_space: param_name -> ("int", lo, hi)
     #                            ("float", lo, hi)
@@ -22,7 +23,7 @@ class ModelSpec:
 
 
 # ---------------------------------------------------------------------------
-# Quantile backend factories
+# Backend factories
 # ---------------------------------------------------------------------------
 
 def _lgb_factory(quantile: float, params: dict) -> Any:
@@ -32,10 +33,17 @@ def _lgb_factory(quantile: float, params: dict) -> Any:
     return lgb.LGBMRegressor(**p)
 
 
-def _lgb_mean_factory(params: dict) -> Any:
+def _lgb_poisson_factory(params: dict) -> Any:
     import lightgbm as lgb  # type: ignore
 
-    p = {**params, "objective": "regression", "verbose": -1}
+    p = {**params, "objective": "poisson", "verbose": -1}
+    return lgb.LGBMRegressor(**p)
+
+
+def _lgb_tweedie_factory(power: float, params: dict) -> Any:
+    import lightgbm as lgb  # type: ignore
+
+    p = {**params, "objective": "tweedie", "tweedie_variance_power": power, "verbose": -1}
     return lgb.LGBMRegressor(**p)
 
 
@@ -56,7 +64,7 @@ def _xgb_factory(quantile: float, params: dict) -> Any:
     return xgb.XGBRegressor(**p)
 
 
-def _xgb_mean_factory(params: dict) -> Any:
+def _xgb_poisson_factory(params: dict) -> Any:
     try:
         import xgboost as xgb  # type: ignore
     except ImportError as exc:
@@ -64,7 +72,24 @@ def _xgb_mean_factory(params: dict) -> Any:
 
     p = {
         **params,
-        "objective": "reg:squarederror",
+        "objective": "count:poisson",
+        "verbosity": 0,
+        "tree_method": params.get("tree_method", "hist"),
+        "enable_categorical": True,
+    }
+    return xgb.XGBRegressor(**p)
+
+
+def _xgb_tweedie_factory(power: float, params: dict) -> Any:
+    try:
+        import xgboost as xgb  # type: ignore
+    except ImportError as exc:
+        raise ImportError("xgboost>=2.0 is required. pip install xgboost") from exc
+
+    p = {
+        **params,
+        "objective": "reg:tweedie",
+        "tweedie_variance_power": power,
         "verbosity": 0,
         "tree_method": params.get("tree_method", "hist"),
         "enable_categorical": True,
@@ -82,13 +107,24 @@ def _catboost_factory(quantile: float, params: dict) -> Any:
     return CatBoostRegressor(**p)
 
 
-def _catboost_mean_factory(params: dict) -> Any:
+def _catboost_poisson_factory(params: dict) -> Any:
     try:
         from catboost import CatBoostRegressor  # type: ignore
     except ImportError as exc:
         raise ImportError("catboost is required. pip install catboost") from exc
 
-    p = {**params, "loss_function": "RMSE", "verbose": 0}
+    p = {**params, "loss_function": "Poisson", "verbose": 0}
+    return CatBoostRegressor(**p)
+
+
+def _catboost_tweedie_factory(power: float, params: dict) -> Any:
+    try:
+        from catboost import CatBoostRegressor  # type: ignore
+    except ImportError as exc:
+        raise ImportError("catboost is required. pip install catboost") from exc
+
+    # Like Poisson, CatBoost predicts Tweedie models on the demand scale (exponent) by default.
+    p = {**params, "loss_function": f"Tweedie:variance_power={power}", "verbose": 0}
     return CatBoostRegressor(**p)
 
 
@@ -99,8 +135,9 @@ def _catboost_mean_factory(params: dict) -> Any:
 REGISTRY: dict[str, ModelSpec] = {
     "lightgbm": ModelSpec(
         name="lightgbm",
-        make_estimator=_lgb_factory,
-        make_mean_estimator=_lgb_mean_factory,
+        make_quantile_estimator=_lgb_factory,
+        make_poisson_estimator=_lgb_poisson_factory,
+        make_tweedie_estimator=_lgb_tweedie_factory,
         default_params={
             "num_leaves": 31,
             "learning_rate": 0.05,
@@ -124,8 +161,9 @@ REGISTRY: dict[str, ModelSpec] = {
     ),
     "xgboost": ModelSpec(
         name="xgboost",
-        make_estimator=_xgb_factory,
-        make_mean_estimator=_xgb_mean_factory,
+        make_quantile_estimator=_xgb_factory,
+        make_poisson_estimator=_xgb_poisson_factory,
+        make_tweedie_estimator=_xgb_tweedie_factory,
         default_params={
             "max_depth": 6,
             "learning_rate": 0.1,
@@ -149,8 +187,9 @@ REGISTRY: dict[str, ModelSpec] = {
     ),
     "catboost": ModelSpec(
         name="catboost",
-        make_estimator=_catboost_factory,
-        make_mean_estimator=_catboost_mean_factory,
+        make_quantile_estimator=_catboost_factory,
+        make_poisson_estimator=_catboost_poisson_factory,
+        make_tweedie_estimator=_catboost_tweedie_factory,
         default_params={
             "iterations": 500,
             "learning_rate": 0.05,
@@ -186,7 +225,7 @@ def available_candidates(names: list[str]) -> list[str]:
         if name not in REGISTRY:
             continue
         try:
-            REGISTRY[name].make_estimator(0.5, REGISTRY[name].default_params)
+            REGISTRY[name].make_quantile_estimator(0.5, REGISTRY[name].default_params)
             result.append(name)
         except ImportError:
             pass

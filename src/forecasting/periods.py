@@ -19,6 +19,42 @@ from src.utils.config import get_project_root
 from src.utils.tracking import config_hash
 
 
+@dataclass(frozen=True)
+class BlockFit:
+    """One forecaster fit and the weeks it writes forecasts for.
+
+    The fit uses rows up to ``fit_end``; their labels reach ``gap`` weeks further, so the
+    newest label lands the week before ``start``. ``index`` counts fits within the block.
+    """
+
+    block: str
+    index: int
+    start: pd.Timestamp
+    end: pd.Timestamp
+    fit_end: pd.Timestamp
+
+    @property
+    def weeks(self) -> int:
+        return int((self.end - self.start).days // 7) + 1
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "block": self.block,
+            "index": self.index,
+            "start": str(self.start.date()),
+            "end": str(self.end.date()),
+            "fit_end": str(self.fit_end.date()),
+            "weeks": self.weeks,
+        }
+
+
+# Blocks whose forecaster is refit every ``refit_every_weeks``. The test block keeps one fit
+# made before its first week, so the VN2 window only uses labels known by week 0.
+REFIT_BLOCKS: tuple[str, ...] = ("rl_train", "rl_val")
+BLOCK_NAMES: dict[str, str] = {"rl_train": "training", "rl_val": "validation", "rl_test": "test"}
+MAX_BLOCK_FITS_WARNING = 12
+
+
 @dataclass
 class Periods:
     """Resolved week boundaries (inclusive Monday dates)."""
@@ -40,8 +76,9 @@ class Periods:
     fit_end_rl_train: pd.Timestamp
     fit_end_rl_val: pd.Timestamp
     fit_end_rl_test: pd.Timestamp
-    refit_per_block: bool
+    refit_every_weeks: int
     folds: list[TimeSeriesFold] = field(default_factory=list)
+    block_fits: list[BlockFit] = field(default_factory=list)
     n_folds_requested: int = 5
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -72,14 +109,10 @@ def panel_weeks(config: dict) -> np.ndarray:
 
 
 def _horizon_gap(config: dict) -> int:
-    """How far a target reaches past the feature week."""
-    model = config.get("forecasting", {}).get("model", {})
-    horizons = model.get("horizons", [0, 1, 2])
-    max_h = max(horizons) if horizons else 0
-    ltd = model.get("lead_time_demand", {})
-    offsets = ltd.get("offsets", [0, 1, 2]) if ltd.get("enabled", False) else [0]
-    max_off = max(offsets) if offsets else 0
-    return int(max(max_h, max_off))
+    """How far a target reaches past the feature week (the longest forecast horizon)."""
+    from src.forecasting.measures import HORIZONS
+
+    return int(max(HORIZONS))
 
 
 def lookback_breakdown(config: dict) -> dict[str, int]:
@@ -101,6 +134,9 @@ def lookback_breakdown(config: dict) -> dict[str, int]:
         if lag_cfg.get("momentum", True):
             peak = max(lags + rolls) if (lags or rolls) else 52
             parts["momentum"] = max(4, 13, peak)
+    profile = feat.get("demand_profile", {})
+    if profile.get("enabled", False):
+        parts["demand profile"] = int(profile.get("window_weeks", 52))
     hier = feat.get("hierarchical", {})
     if hier.get("enabled", True):
         group_lags = [int(x) for x in (hier.get("group_lags") or [])]
@@ -126,9 +162,9 @@ def label_gap_weeks(config: dict) -> int:
 def required_gap(config: dict) -> int:
     """Weeks left out of the training fit before each scored block.
 
-    This is the forecast horizon. A training row's label reaches that far forward
-    (``target_h*`` and lead-time demand). Backward lags, including a 52-week
-    seasonal lag, use only earlier sales, so they do not widen the embargo.
+    This is the forecast horizon. A training row's label (``target_h*``) reaches that
+    far forward. Backward lags, including a 52-week seasonal lag, use only earlier
+    sales, so they do not widen the embargo.
     """
     return label_gap_weeks(config)
 
@@ -165,15 +201,16 @@ def resolve_periods(config: dict, weeks: np.ndarray | None = None) -> Periods:
             fit_end_rl_train=pd.NaT,
             fit_end_rl_val=pd.NaT,
             fit_end_rl_test=pd.NaT,
-            refit_per_block=True,
+            refit_every_weeks=0,
             errors=["No weeks found in sales panel."],
         )
 
     pcfg = _periods_cfg(config)
     gap = required_gap(config)
     label_gap = label_gap_weeks(config)
-    lead = int(config.get("rl", {}).get("environment", {}).get("lead_time_weeks", 2))
-    min_ep = lead + 2
+    from src.simulation.vn2 import VN2Rules
+
+    min_ep = VN2Rules.from_config(config).lead_time_weeks + 2
 
     data_start = pd.Timestamp(pcfg.get("data_start") or weeks[0])
     data_end = pd.Timestamp(pcfg.get("end") or weeks[-1])
@@ -187,7 +224,7 @@ def resolve_periods(config: dict, weeks: np.ndarray | None = None) -> Periods:
     test_w = int(pcfg.get("rl_test_weeks", 9))
     val_w = int(pcfg.get("rl_val_weeks", 8))
     train_w = int(pcfg.get("rl_train_weeks", 26))
-    refit = bool(pcfg.get("refit_per_block", True))
+    refit_n = int(pcfg.get("refit_every_weeks", 0) or 0)
 
     errors: list[str] = []
     warnings: list[str] = []
@@ -206,6 +243,14 @@ def resolve_periods(config: dict, weeks: np.ndarray | None = None) -> Periods:
     train_start_i = train_end_i - train_w + 1
     forecaster_end_i = train_start_i - gap - 1
 
+    min_test_val = 8
+    min_train = 12
+    if test_w < min_test_val:
+        errors.append(f"RL test block ({test_w}w) must be >= {min_test_val} (VN2 window).")
+    if val_w < min_test_val:
+        errors.append(f"RL validation block ({val_w}w) must be >= {min_test_val}.")
+    if train_w < min_train:
+        errors.append(f"RL train block ({train_w}w) must be >= {min_train} (burn-in + window).")
     if test_w < min_ep:
         errors.append(f"RL test block ({test_w}w) must be >= {min_ep} (lead_time+2).")
     if val_w < min_ep:
@@ -214,6 +259,9 @@ def resolve_periods(config: dict, weeks: np.ndarray | None = None) -> Periods:
         errors.append(f"RL train block ({train_w}w) must be >= {min_ep}.")
     if forecaster_end_i < 0:
         errors.append("Forecaster region is empty; shorten RL blocks or widen the date range.")
+    if refit_n < 0:
+        errors.append("Refit cadence must be 0 (one fit per block) or a positive number of weeks.")
+        refit_n = 0
 
     def ts(i: int) -> pd.Timestamp:
         return pd.Timestamp(weeks[i])
@@ -222,8 +270,28 @@ def resolve_periods(config: dict, weeks: np.ndarray | None = None) -> Periods:
     fit_end_val_i = val_start_i - gap - 1
     fit_end_test_i = test_start_i - gap - 1
 
-    if not refit:
-        fit_end_val_i = fit_end_test_i = fit_end_train_i
+    def _chunks(block: str, start_i: int, end_i: int) -> list[BlockFit]:
+        """Consecutive fits of ``refit_n`` weeks from the block start (one if 0 or test)."""
+        if end_i < start_i or start_i < 0:
+            return []
+        length = end_i - start_i + 1
+        step = refit_n if (refit_n > 0 and block in REFIT_BLOCKS) else length
+        out: list[BlockFit] = []
+        for s_i in range(start_i, end_i + 1, step):
+            e_i = min(s_i + step - 1, end_i)
+            out.append(BlockFit(block, len(out) + 1, ts(s_i), ts(e_i), ts(max(0, s_i - gap - 1))))
+        return out
+
+    block_fits = (
+        _chunks("rl_train", train_start_i, train_end_i)
+        + _chunks("rl_val", val_start_i, val_end_i)
+        + _chunks("rl_test", test_start_i, test_end_i)
+    )
+    if len(block_fits) > MAX_BLOCK_FITS_WARNING:
+        warnings.append(
+            f"{len(block_fits)} forecaster fits for the RL blocks. Each fit takes minutes, so "
+            "a short refit cadence makes the run much longer."
+        )
 
     val_cfg = config.get("forecasting", {}).get("validation", {})
     n_folds_req = int(val_cfg.get("n_folds", 5))
@@ -257,11 +325,12 @@ def resolve_periods(config: dict, weeks: np.ndarray | None = None) -> Periods:
 
     init_date = config.get("data", {}).get("initial_state_date")
     if init_date:
-        init_ts = pd.Timestamp(init_date)
-        if ts(test_start_i) != init_ts:
+        # The official window starts the week after the initial-state snapshot.
+        official_start = pd.Timestamp(init_date) + pd.Timedelta(weeks=1)
+        if ts(test_start_i) != official_start:
             warnings.append(
-                f"RL test starts {ts(test_start_i).date()} but initial_state_date is "
-                f"{init_ts.date()}; test block will use warm-start inventory."
+                f"RL test starts {ts(test_start_i).date()} but the official VN2 window starts "
+                f"{official_start.date()}; the test block will use warm-start inventory."
             )
 
     return Periods(
@@ -282,12 +351,68 @@ def resolve_periods(config: dict, weeks: np.ndarray | None = None) -> Periods:
         fit_end_rl_train=ts(max(0, fit_end_train_i)),
         fit_end_rl_val=ts(max(0, fit_end_val_i)),
         fit_end_rl_test=ts(max(0, fit_end_test_i)),
-        refit_per_block=refit,
+        refit_every_weeks=refit_n,
         folds=folds,
+        block_fits=block_fits,
         n_folds_requested=n_folds_req,
         errors=errors,
         warnings=warnings,
     )
+
+
+def fit_lane(block: str, index: int, n_in_block: int) -> str:
+    """Timeline lane of a block fit, e.g. ``Fit · training 2/4``."""
+    name = BLOCK_NAMES.get(block, block)
+    return f"Fit · {name}" if n_in_block <= 1 else f"Fit · {name} {index}/{n_in_block}"
+
+
+def block_fit_counts(resolved: dict) -> dict[str, int]:
+    """Fits per block from a saved ``resolved`` record (records without fits: one per block)."""
+    fits = resolved.get("block_fits") or []
+    counts = {b: sum(1 for f in fits if f.get("block") == b) for b in BLOCK_NAMES}
+    return {b: (n or 1) for b, n in counts.items()}
+
+
+def decision_ages(periods: Periods, window_weeks: int = 8, n_rounds: int = 6) -> pd.DataFrame:
+    """
+    Age of the forecaster behind each order decision, in weeks since its ``fit_end``.
+
+    One row per block and decision Monday. ``windows`` counts the 8-week windows of the
+    block that place an order that Monday, so a weighted mean over rows equals the mean
+    over every (window, decision) pair the agent sees.
+    """
+    rows: list[dict[str, Any]] = []
+    week = pd.Timedelta(weeks=1)
+    for block in BLOCK_NAMES:
+        fits = [f for f in periods.block_fits if f.block == block]
+        if not fits:
+            continue
+        start, end = fits[0].start, fits[-1].end
+        counts: dict[pd.Timestamp, int] = {}
+        s = start
+        while s + (window_weeks - 1) * week <= end:
+            for j in range(n_rounds):
+                d = s + j * week
+                counts[d] = counts.get(d, 0) + 1
+            s += week
+        for d in sorted(counts):
+            fit = next((f for f in fits if f.start <= d <= f.end), fits[-1])
+            rows.append({
+                "block": block,
+                "date": d,
+                "age_weeks": int((d - fit.fit_end).days // 7),
+                "fit": fit.index,
+                "windows": counts[d],
+            })
+    return pd.DataFrame(rows, columns=["block", "date", "age_weeks", "fit", "windows"])
+
+
+def mean_decision_age(ages: pd.DataFrame) -> dict[str, float]:
+    """Mean forecaster age per block over every (window, decision) pair."""
+    out: dict[str, float] = {}
+    for block, g in ages.groupby("block", sort=False):
+        out[str(block)] = float((g["age_weeks"] * g["windows"]).sum() / max(g["windows"].sum(), 1))
+    return out
 
 
 def timeline(periods: Periods) -> pd.DataFrame:
@@ -339,8 +464,15 @@ def timeline(periods: Periods) -> pd.DataFrame:
         gap_start_i = int(np.searchsorted(periods.weeks, np.datetime64(periods.forecaster_cv_end))) + 1
         add_embargo("Forecaster", gap_start_i, gap_start_i + periods.gap_weeks - 1)
     add("RL", "Train", periods.rl_train_start, periods.rl_train_end)
-    add("RL", "Validation (checkpoint)", periods.rl_val_start, periods.rl_val_end)
-    add("RL", "Test (final score)", periods.rl_test_start, periods.rl_test_end)
+    add("RL", "Validation (selection)", periods.rl_val_start, periods.rl_val_end)
+    add("RL", "Test (production)", periods.rl_test_start, periods.rl_test_end)
+
+    for fit in periods.block_fits:
+        lane = fit_lane(fit.block, fit.index, sum(f.block == fit.block for f in periods.block_fits))
+        add(lane, "Fit", periods.data_start, fit.fit_end)
+        hole_start = int(np.searchsorted(periods.weeks, np.datetime64(fit.fit_end))) + 1
+        add_embargo(lane, hole_start, hole_start + periods.gap_weeks - 1)
+        add(lane, "Forecasts written", fit.start, fit.end)
 
     for fold in periods.folds:
         add(
@@ -386,7 +518,8 @@ def periods_to_dict(periods: Periods) -> dict[str, Any]:
         "fit_end_rl_train": str(periods.fit_end_rl_train.date()),
         "fit_end_rl_val": str(periods.fit_end_rl_val.date()),
         "fit_end_rl_test": str(periods.fit_end_rl_test.date()),
-        "refit_per_block": periods.refit_per_block,
+        "refit_every_weeks": periods.refit_every_weeks,
+        "block_fits": [f.to_dict() for f in periods.block_fits],
     }
 
 
@@ -394,22 +527,15 @@ def build_setup_record(
     config: dict,
     periods: Periods,
     run_id: str | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Serializable setup written beside forecasts for RL and UI staleness checks."""
-    hash_payload = {
-        "periods": config.get("periods"),
-        "forecasting": {
-            k: v
-            for k, v in config.get("forecasting", {}).items()
-            if k not in ("mlflow", "artifacts")
-        },
-        "data": {
-            k: config.get("data", {}).get(k)
-            for k in ("sales_file", "initial_state_date")
-        },
-    }
+    """Serializable setup written beside forecasts for RL and UI staleness checks.
+
+    ``extra`` carries the run's measure manifest (see ``measures.manifest_record``).
+    """
     return {
-        "config_hash": config_hash(hash_payload),
+        **(extra or {}),
+        "config_hash": current_setup_hash(config),
         "run_id": run_id,
         "resolved": periods_to_dict(periods),
         "timeline": timeline(periods).assign(
