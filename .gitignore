@@ -23,15 +23,16 @@ catboost_info/
 
 # Backups and temp
 ._backup/
-backups/
-archive/
+/backups/
+/archive/
 *.db.bak
 
-# Ops loop state and Airflow (local only; MLflow is the record)
-ops/
-airflow_home/
-.venv-airflow/
-.env
+# Ops loop state and Airflow (local only; MLflow is the record). Anchored to the repo root:
+# a bare `ops/` would also hide the src/ops package.
+/ops/
+/airflow_home/
+/.venv-airflow/
+/.env
 
 # OS / editors
 .DS_Store

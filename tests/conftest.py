@@ -23,6 +23,11 @@ def isolated_mlflow(tmp_path_factory, monkeypatch):
     uri = f"sqlite:///{store / 'mlflow.db'}"
     monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
     mlflow.set_tracking_uri(uri)
+    # Runs started without choosing an experiment would land in the store's Default experiment,
+    # whose artifacts default to ./mlruns/0 — the live folder. MLflow also keeps the active
+    # experiment across tests, so every test gets its own, pinned under its temp dir.
+    experiment = mlflow.create_experiment("tests", artifact_location=(store / "artifacts").as_uri())
+    mlflow.set_experiment(experiment_id=experiment)
     yield uri
     while mlflow.active_run():
         mlflow.end_run()

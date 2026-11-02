@@ -141,38 +141,30 @@ def add_calendar_features(
     weeks_until_max = hol_cfg.get("weeks_until_max", 4)
     weeks_since_max = hol_cfg.get("weeks_since_max", 2)
 
+    # Distances come from the event calendar itself, not from the weeks present in the panel, so
+    # a week's values don't depend on where the panel stops: a serving panel ends at the decision
+    # week, and an event 2 weeks ahead must read 2 there too (tests/test_feature_pit.py).
     min_d, max_d = out[date_col].min(), out[date_col].max()
-    hol_cal = _build_holiday_calendar(min_d, max_d, events)
-
-    unique_dates = pd.DataFrame({date_col: sorted(out[date_col].unique())})
-
+    hol_cal = _build_holiday_calendar(
+        min_d - pd.Timedelta(weeks=weeks_since_max + 1),
+        max_d + pd.Timedelta(weeks=weeks_until_max + 1),
+        events,
+    )
+    dates = np.sort(out[date_col].unique()).astype("datetime64[ns]")
+    week = np.timedelta64(7, "D")
+    feats = pd.DataFrame({date_col: dates})
     for event in events:
-        event_weeks = hol_cal.loc[hol_cal["event"] == event, ["date", "is_holiday_week"]]
-        event_weeks = event_weeks.rename(columns={"date": date_col})
+        weeks = np.sort(hol_cal.loc[hol_cal["event"] == event, "date"].to_numpy(dtype="datetime64[ns]"))
+        nxt = np.searchsorted(weeks, dates, side="left")  # first event week on or after the date
+        until = np.full(len(dates), weeks_until_max + 1)
+        has_next = nxt < len(weeks)
+        until[has_next] = (weeks[nxt[has_next]] - dates[has_next]) // week
+        prv = np.searchsorted(weeks, dates, side="right") - 1  # last event week on or before it
+        since = np.full(len(dates), weeks_since_max + 1)
+        has_prev = prv >= 0
+        since[has_prev] = (dates[has_prev] - weeks[prv[has_prev]]) // week
+        feats[f"{event}_weeks_until"] = np.clip(until, 0, weeks_until_max)
+        feats[f"{event}_is_holiday"] = np.isin(dates, weeks).astype(int)
+        feats[f"{event}_weeks_since"] = np.clip(since, 0, weeks_since_max)
 
-        merged = unique_dates.merge(event_weeks, on=date_col, how="left")
-        merged["is_holiday_week"] = merged["is_holiday_week"].fillna(0).astype(int)
-
-        # weeks until next holiday week
-        hol_idx = merged.index[merged["is_holiday_week"] == 1].tolist()
-        until = np.full(len(merged), weeks_until_max + 1)
-        for i in range(len(merged)):
-            future = [h for h in hol_idx if h >= i]
-            if future:
-                until[i] = min(future[0] - i, weeks_until_max + 1)
-        merged[f"{event}_weeks_until"] = np.clip(until, 0, weeks_until_max)
-        merged[f"{event}_is_holiday"] = merged["is_holiday_week"]
-
-        # weeks since last holiday week
-        since = np.full(len(merged), weeks_since_max + 1)
-        for i in range(len(merged)):
-            past = [h for h in hol_idx if h <= i]
-            if past:
-                since[i] = min(i - past[-1], weeks_since_max + 1)
-        merged[f"{event}_weeks_since"] = np.clip(since, 0, weeks_since_max)
-
-        drop_cols = ["is_holiday_week"]
-        feat_cols = [c for c in merged.columns if c not in [date_col] + drop_cols]
-        out = out.merge(merged[[date_col] + feat_cols], on=date_col, how="left")
-
-    return out
+    return out.merge(feats, on=date_col, how="left")

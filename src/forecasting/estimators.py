@@ -27,24 +27,32 @@ class ModelSpec:
 # Backend factories
 # ---------------------------------------------------------------------------
 
+def _lgb_params(params: dict) -> dict:
+    """LightGBM bags rows only when ``subsample_freq`` > 0; without it ``subsample`` is silently ignored."""
+    p = dict(params)
+    if p.get("subsample", 1.0) < 1.0:
+        p.setdefault("subsample_freq", 1)
+    return p
+
+
 def _lgb_factory(quantile: float, params: dict) -> Any:
     import lightgbm as lgb  # type: ignore
 
-    p = {**params, "objective": "quantile", "alpha": quantile, "verbose": -1}
+    p = {**_lgb_params(params), "objective": "quantile", "alpha": quantile, "verbose": -1}
     return lgb.LGBMRegressor(**p)
 
 
 def _lgb_poisson_factory(params: dict) -> Any:
     import lightgbm as lgb  # type: ignore
 
-    p = {**params, "objective": "poisson", "verbose": -1}
+    p = {**_lgb_params(params), "objective": "poisson", "verbose": -1}
     return lgb.LGBMRegressor(**p)
 
 
 def _lgb_tweedie_factory(power: float, params: dict) -> Any:
     import lightgbm as lgb  # type: ignore
 
-    p = {**params, "objective": "tweedie", "tweedie_variance_power": power, "verbose": -1}
+    p = {**_lgb_params(params), "objective": "tweedie", "tweedie_variance_power": power, "verbose": -1}
     return lgb.LGBMRegressor(**p)
 
 
