@@ -160,6 +160,10 @@ periods:
 rl:
   # Seeds trained per configuration; project.seed must be among them (its weights ship).
   seeds: [42, 43, 44]
+  # Forecasts the agent trains on: as_is | unbiased (each training fit's average forecast
+  # error removed) | unbiased_by_class (removed per fit and demand class). Validation and
+  # test always use the real forecasts. Default on the Run RL page.
+  training_forecasts: unbiased_by_class
   methods:
     # Correction on the lost-sales anchor: order = anchor + f · max(anchor, floor_frac · scale).
     residual:
@@ -191,6 +195,14 @@ rl:
       # Reward = anchor's cost minus the policy's cost on the same window (same optimum,
       # far less noise than the raw cost).
       paired_reward: true
+      # Early stopping on the training sample (the fixed training windows behind the learning
+      # curve; validation is never used): scored every early_stop_every iterations, training stops
+      # once it hasn't improved by early_stop_min_delta points for early_stop_patience iterations
+      # and keeps the weights at the stop. ``iterations`` is then the budget.
+      early_stop: false
+      early_stop_patience: 400
+      early_stop_min_delta: 0.2
+      early_stop_every: 100
 
     grpo:
       iterations: 300
@@ -207,6 +219,11 @@ rl:
       # batch: advantages keep their euro weight (one batch-wide scale); group: divide by
       # each group's spread (textbook GRPO, weights every window equally).
       advantage_scale: batch
+      # Early stopping on the training sample, as for PPO.
+      early_stop: false
+      early_stop_patience: 400
+      early_stop_min_delta: 0.2
+      early_stop_every: 100
 
     dqn:
       learning_rate: 0.0001

@@ -10,6 +10,8 @@ build/
 
 # MLflow
 mlruns.db
+mlruns.db-wal
+mlruns.db-shm
 mlruns/
 mlartifacts/
 .mlflow/
@@ -21,6 +23,15 @@ catboost_info/
 
 # Backups and temp
 ._backup/
+backups/
+archive/
+*.db.bak
+
+# Ops loop state and Airflow (local only; MLflow is the record)
+ops/
+airflow_home/
+.venv-airflow/
+.env
 
 # OS / editors
 .DS_Store
