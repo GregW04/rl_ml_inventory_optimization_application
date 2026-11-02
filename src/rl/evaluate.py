@@ -2,7 +2,8 @@
 Score the validation champion once on the test block ("production"), in euros.
 
 The champion was fixed on validation (``src.rl.selection``); nothing here feeds back
-into training or selection. Each forecasting run gets one test score. Scoring again
+into training or selection. A gated champion orders the anchor outside its gate's demand
+classes. Each forecasting run gets one test score. Scoring again
 needs ``--override-lock`` and the new run is tagged ``post_hoc=true``.
 """
 
@@ -19,7 +20,14 @@ import matplotlib.pyplot as plt
 import mlflow
 import pandas as pd
 
-from src.rl.rollout import ZeroResidual, anchor_baseline, paired_bootstrap_ci, per_class_delta, rollout
+from src.rl.rollout import (
+    ZeroResidual,
+    anchor_baseline,
+    paired_bootstrap_ci,
+    per_class_delta,
+    rollout,
+    units_vs_anchor,
+)
 from src.rl.selection import ANCHOR, champion, leaderboard, load_policy
 from src.rl.spec import PolicySpec, default_state
 from src.rl.train import RunData, block_episodes, load_run_data, official_window_start
@@ -64,18 +72,21 @@ def _anchor_spec(data: RunData) -> PolicySpec:
     )
 
 
-def _pick(config: dict, data: RunData, which: str) -> tuple[str, PolicySpec, object, pd.Series | None]:
-    """(champion id, spec, policy, leaderboard row) for ``auto``, ``anchor`` or an RL run id."""
+def _pick(
+    config: dict, data: RunData, which: str
+) -> tuple[str, PolicySpec, object, pd.Series | None, tuple[str, ...] | None]:
+    """(champion id, spec, policy, leaderboard row, class gate) for ``auto``, ``anchor`` or an RL run id."""
     row = None
     if which == "auto":
         row = champion(leaderboard(config, str(data.run_id)))
         which = ANCHOR if row is None or row["kind"] == ANCHOR else row["deploy_run_id"]
     if which == ANCHOR:
-        return ANCHOR, _anchor_spec(data), ZeroResidual(), row
+        return ANCHOR, _anchor_spec(data), ZeroResidual(), row, None
     spec, agent = load_policy(config, which)
     if spec.forecast_run_id != str(data.run_id):
         raise ValueError(f"RL run {which} was trained on forecasting run {spec.forecast_run_id}.")
-    return which, spec, agent, row
+    gate = row.get("gate") if row is not None else None
+    return which, spec, agent, row, gate if isinstance(gate, tuple) and gate else None
 
 
 def score_test(
@@ -96,16 +107,18 @@ def score_test(
     legacy = legacy_test_runs(config, forecast_run_id)
     post_hoc = not previous.empty or not legacy.empty
     data = load_run_data(config, forecast_run_id)
-    chosen, spec, policy, row = _pick(config, data, champion_id)
+    chosen, spec, policy, row, gate = _pick(config, data, champion_id)
     episodes = block_episodes(config, data, "rl_test")
     if not episodes:
         raise RuntimeError("No RL test episodes; check the forecasting run's periods.")
 
-    kpis, per_ep = rollout(policy, spec, episodes, data.lookup, data.scales, data.rules)
+    kpis, per_ep = rollout(policy, spec, episodes, data.lookup, data.scales, data.rules, gate=gate)
     base_spec, base_policy = anchor_baseline(spec)
     an_kpis, an_eps = rollout(base_policy, base_spec, episodes, data.lookup, data.scales, data.rules)
     per_ep = per_ep.merge(
-        an_eps[["store", "product", "window_start", "cost_eur"]].rename(columns={"cost_eur": "anchor_cost_eur"}),
+        an_eps[["store", "product", "window_start", "cost_eur", "units"]].rename(
+            columns={"cost_eur": "anchor_cost_eur", "units": "anchor_units"}
+        ),
         on=["store", "product", "window_start"],
     )
     lo, hi = paired_bootstrap_ci((per_ep["cost_eur"] - per_ep["anchor_cost_eur"]).to_numpy())
@@ -123,6 +136,9 @@ def score_test(
     }
     for cls, value in per_class_delta(per_ep).items():
         metrics[f"test_minus_anchor_pct_{cls.lower()}"] = value
+    units = units_vs_anchor(per_ep)
+    if units is not None:
+        metrics["test_units_vs_anchor_pct"] = units
     if not official.empty:
         metrics["test_vn2_score_eur"] = float(official["cost_eur"].sum())
         metrics["test_anchor_vn2_score_eur"] = float(official["anchor_cost_eur"].sum())
@@ -134,7 +150,8 @@ def score_test(
             "stage": "test",
             "forecast_run_id": forecast_run_id,
             "champion": chosen,
-            "champion_config_key": ANCHOR if chosen == ANCHOR else spec.config_key(),
+            "champion_config_key": ANCHOR if chosen == ANCHOR else spec.config_key() + ("+gate" if gate else ""),
+            "champion_gate": ", ".join(gate) if gate else "",
             "post_hoc": str(post_hoc).lower(),
             "legacy_test_evaluations": str(len(legacy)),
         })
@@ -155,7 +172,7 @@ def score_test(
             per_ep.to_parquet(path, index=False)
             mlflow.log_artifact(str(path), artifact_path="test")
         _log_comparison_chart(chosen, metrics)
-        return {"test_run_id": run.info.run_id, "champion": chosen, "post_hoc": post_hoc, **metrics}
+        return {"test_run_id": run.info.run_id, "champion": chosen, "gate": gate, "post_hoc": post_hoc, **metrics}
 
 
 def _log_comparison_chart(chosen: str, metrics: dict) -> None:

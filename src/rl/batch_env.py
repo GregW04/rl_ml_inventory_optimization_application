@@ -227,6 +227,7 @@ class BatchVN2Env:
         zeros = torch.zeros_like(self.inv)
         order = self.resolve(action) if (t < self.rounds and action is not None) else zeros
         sh_order = self._decide(self.sh_inv, self.sh_p0, self.sh_p1, t)[0] if t < self.rounds else zeros
+        self.last_order, self.last_shadow_order = order, sh_order
         demand = self.sales[idx, t]
         cost, self.inv, self.p0, self.p1 = self._week(self.inv, self.p0, self.p1, order, demand)
         sh_cost, self.sh_inv, self.sh_p0, self.sh_p1 = self._week(self.sh_inv, self.sh_p0, self.sh_p1, sh_order, demand)

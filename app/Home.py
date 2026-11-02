@@ -61,7 +61,7 @@ else:
         rows.append({
             "forecasting run": lib.forecast_run_label(r),
             "measures": r.get("params.measures") or "(legacy)",
-            "RL configurations": int((board["kind"] == "rl").sum()) if not board.empty else 0,
+            "RL configurations": int(((board["kind"] == "rl") & board["gate"].isna()).sum()) if not board.empty else 0,
             "validation champion": "anchor" if champ is None or champ["kind"] == "anchor" else champ["candidate"],
             "test (production)": (
                 f"{tests.iloc[0]['metrics.test_cost_eur_per_sku']:.3f} € / SKU-window"
@@ -78,5 +78,6 @@ st.markdown(
     "2. **Run RL** — pick a forecasting run, choose state and method, train, compare on validation, score test once\n"
     "3. **Experiments** — browse & compare MLflow runs\n"
     "4. **Forecasts** — actual vs forecast per horizon, coverage, feature importance\n"
-    "5. **Inventory & RL** — a training run's curve, validation result and order recommendations"
+    "5. **Inventory & RL** — training sample → validation for one or more configurations, where a policy wins and "
+    "loses, and order recommendations with the reason"
 )

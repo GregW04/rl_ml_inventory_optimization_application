@@ -161,6 +161,62 @@ def as_measures(rows: list[dict]) -> list[Measure]:
     return [Measure.from_dict(d) for d in rows]
 
 
+@st.cache_data(ttl=600, show_spinner="Loading sales history…")
+def sales_history() -> pd.DataFrame:
+    """Weekly sales of every SKU (out-of-stock weeks are NaN), for drift diagnostics."""
+    from src.forecasting.preprocessing import load_panel_from_config
+
+    return load_panel_from_config(get_config())[["store", "product", "date", "sales"]]
+
+
+@st.cache_data(ttl=600, show_spinner="Classifying demand patterns…")
+def demand_classes() -> pd.DataFrame:
+    """Demand pattern of every SKU-week (Smooth, Erratic, Intermittent, Lumpy, Unclassified)."""
+    from src.rl.vn2_data import attach_demand_class
+
+    return attach_demand_class(sales_history().copy(), get_config())[["store", "product", "date", "demand_class"]]
+
+
+@st.cache_data(ttl=60, show_spinner="Computing forecast drift…")
+def run_drift(run_id: str, include_test: bool) -> dict:
+    """Forecast drift of a run: per-fit table, per-class table, weekly errors; {} without forecasts."""
+    from src.forecasting import drift
+
+    init_tracking()
+    record = run_setup(run_id)
+    path = fetch_run_file(get_config(), run_id, "train_forecasts.parquet")
+    if record is None or path is None:
+        return {}
+    forecasts = pd.read_parquet(path)
+    measures = as_measures(measures_of_run(run_id))
+    resolved = record.get("resolved", {})
+    sales = sales_history()
+    level = drift.h0_level_measure(measures)
+    return {
+        "level": level.id if level else None,
+        "fits": drift.fit_bias(forecasts, sales, resolved, measures, include_test),
+        "by_class": (drift.fit_bias(forecasts, sales, resolved, [level], include_test, classes=demand_classes())
+                     if level else pd.DataFrame()),
+        "weekly": drift.weekly_bias(forecasts, sales, resolved, level, include_test) if level else pd.DataFrame(),
+        "blocks": drift.block_bias(forecasts, sales, resolved, level, include_test) if level and level.kind == "mean" else {},
+    }
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def run_block_bias(run_id: str, include_test: bool) -> tuple[str | None, dict[str, float]]:
+    """(h0 mean id, forecast error % per block) of a run; (None, {}) when it cannot be computed."""
+    from src.forecasting import drift
+
+    init_tracking()
+    record = run_setup(run_id)
+    path = fetch_run_file(get_config(), run_id, "train_forecasts.parquet")
+    level = drift.h0_level_measure(as_measures(measures_of_run(run_id)))
+    if record is None or path is None or level is None or level.kind != "mean":
+        return None, {}
+    blocks = drift.block_bias(pd.read_parquet(path), sales_history(), record.get("resolved", {}), level, include_test)
+    return level.id, blocks
+
+
 def forecast_run_label(r: pd.Series) -> str:
     """Start time, short id and the run's primary CV score."""
     started = r["start_time"].to_pydatetime().astimezone()
@@ -214,6 +270,27 @@ def rl_train_runs(forecast_run_id: str | None = None) -> pd.DataFrame:
     if forecast_run_id:
         keep &= runs.get("tags.forecast_run_id") == forecast_run_id
     return runs[keep]
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def rl_history(run_id: str, keys: tuple[str, ...]) -> pd.DataFrame:
+    """Logged history of ``keys`` for one RL training run, long format (key, step, value)."""
+    init_tracking()
+    frames = [h.assign(key=k) for k in keys if not (h := tracking.get_metric_history(run_id, k)).empty]
+    if not frames:
+        return pd.DataFrame(columns=["key", "step", "value"])
+    return pd.concat(frames, ignore_index=True)[["key", "step", "value"]]
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def rl_episodes(run_id: str, name: str) -> pd.DataFrame:
+    """A per-episode table saved with an RL run (``val_episodes``, ``insample_episodes``); empty if missing."""
+    from src.rl.selection import policy_dir
+
+    try:
+        return pd.read_parquet(policy_dir(get_config(), run_id) / f"{name}.parquet")
+    except Exception:  # noqa: BLE001 - a missing artifact only hides its charts
+        return pd.DataFrame()
 
 
 # ---------------------------------------------------------------------------

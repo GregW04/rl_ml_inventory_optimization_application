@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import matplotlib
@@ -31,7 +31,7 @@ from src.forecasting.measures import Measure, run_measures
 from src.forecasting.periods import fetch_run_file, load_run_setup
 from src.forecasting.preprocessing import load_initial_state, load_panel_from_config
 from src.rl.agents import build_agent, model_file, wrap_vec_env
-from src.rl.rollout import anchor_baseline, per_class_delta, rollout
+from src.rl.rollout import anchor_baseline, per_class_delta, per_class_units, rollout, units_vs_anchor
 from src.rl.spec import STEPS_PER_EPISODE, PolicySpec, is_torch_agent, validate_spec
 from src.rl.vn2_data import _PANEL_COLS, build_forecast_lookup, build_vn2_episodes, compute_demand_scales
 from src.simulation.anchor import AnchorSpec, resolve_anchor
@@ -185,6 +185,7 @@ class MultiSKUInventoryEnv(gym.Env):
 INSAMPLE_WINDOWS = 2_000
 CURVE_POINTS = 10
 CURVE_METRIC = "insample_vs_anchor_pct"
+UNITS_METRIC = "insample_units_vs_anchor_pct"
 
 
 def insample_keys(train_eps: dict, n: int = INSAMPLE_WINDOWS, seed: int = 123) -> list:
@@ -199,20 +200,26 @@ def insample_keys(train_eps: dict, n: int = INSAMPLE_WINDOWS, seed: int = 123) -
 class InSampleCurve(BaseCallback):
     """DQN: cost against the anchor on a fixed sample of training windows, about 10 times a run."""
 
-    def __init__(self, spec: PolicySpec, sub_eps: dict, data: RunData, every: int):
+    def __init__(self, spec: PolicySpec, sub_eps: dict, data: RunData, every: int, lookup: dict | None = None):
         super().__init__()
         self.spec, self.sub_eps, self.data = spec, sub_eps, data
+        self.lookup = data.lookup if lookup is None else lookup
         self.every, self.next = max(1, int(every)), max(1, int(every))
         base_spec, base_policy = anchor_baseline(spec)
-        kpis, _ = rollout(base_policy, base_spec, sub_eps, data.lookup, data.scales, data.rules)
+        kpis, eps = rollout(base_policy, base_spec, sub_eps, self.lookup, data.scales, data.rules)
         self.anchor_cost = kpis["window_cost_eur"]
+        self.anchor_units = float(eps["units"].sum()) if len(eps) else 0.0
         self.points: list[tuple[int, float]] = []
 
     def record(self, model, steps: int) -> None:
-        kpis, _ = rollout(model, self.spec, self.sub_eps, self.data.lookup, self.data.scales, self.data.rules)
+        kpis, eps = rollout(model, self.spec, self.sub_eps, self.lookup, self.data.scales, self.data.rules)
         pct = 100.0 * (kpis["window_cost_eur"] / self.anchor_cost - 1.0) if self.anchor_cost > 0 else 0.0
+        units = 100.0 * (float(eps["units"].sum()) / self.anchor_units - 1.0) if self.anchor_units > 0 else 0.0
         windows = int(steps // STEPS_PER_EPISODE)
-        mlflow.log_metric(CURVE_METRIC, pct, step=windows)
+        metrics = {CURVE_METRIC: pct, UNITS_METRIC: units}
+        if steps > 0:  # DQN updates its exploration rate only once it steps
+            metrics["exploration_rate"] = float(model.exploration_rate)
+        mlflow.log_metrics(metrics, step=windows)
         self.points.append((windows, pct))
         print(f"[dqn] step {steps:>9,} · training-sample cost vs anchor {pct:+.2f}%", flush=True)
 
@@ -220,7 +227,8 @@ class InSampleCurve(BaseCallback):
         self.record(self.model, 0)
 
     def _on_step(self) -> bool:
-        if self.num_timesteps >= self.next:
+        # The last point is scored after learn(): DQN still takes a gradient step after its last callback.
+        if self.next <= self.num_timesteps < self.spec.total_timesteps:
             self.record(self.model, self.num_timesteps)
             self.next += self.every
         return True
@@ -251,7 +259,9 @@ def validate(agent, spec: PolicySpec, data: RunData, episodes: dict) -> tuple[di
     base_spec, base_policy = anchor_baseline(spec)
     an_kpis, an_eps = rollout(base_policy, base_spec, episodes, data.lookup, data.scales, data.rules)
     per_ep = rl_eps.merge(
-        an_eps[["store", "product", "window_start", "cost_eur"]].rename(columns={"cost_eur": "anchor_cost_eur"}),
+        an_eps[["store", "product", "window_start", "cost_eur", "units"]].rename(
+            columns={"cost_eur": "anchor_cost_eur", "units": "anchor_units"}
+        ),
         on=["store", "product", "window_start"],
     )
     delta = rl_kpis["cost_eur_per_sku"] - an_kpis["cost_eur_per_sku"]
@@ -266,14 +276,19 @@ def validate(agent, spec: PolicySpec, data: RunData, episodes: dict) -> tuple[di
     }
     for cls, value in per_class_delta(per_ep).items():
         metrics[f"val_minus_anchor_pct_{cls.lower()}"] = value
+    units = units_vs_anchor(per_ep)
+    if units is not None:
+        metrics["val_units_vs_anchor_pct"] = units
+    for cls, value in per_class_units(per_ep).items():
+        metrics[f"val_units_vs_anchor_pct_{cls.lower()}"] = value
     return metrics, per_ep
 
 
-def _train_dqn(spec: PolicySpec, data: RunData, train_eps: dict, sub_keys: list):
+def _train_dqn(spec: PolicySpec, data: RunData, train_eps: dict, sub_keys: list, lookup: dict):
     """Stable-Baselines3 DQN on the episode sampler; returns (agent, VecNormalize, curve points)."""
 
     def _make_env():
-        return MultiSKUInventoryEnv(spec, train_eps, data.lookup, data.scales, data.rules, seed=spec.seed)
+        return MultiSKUInventoryEnv(spec, train_eps, lookup, data.scales, data.rules, seed=spec.seed)
 
     # Normalize rewards only (observations are already scaled and clipped in the env).
     vec_env = VecNormalize(
@@ -285,14 +300,13 @@ def _train_dqn(spec: PolicySpec, data: RunData, train_eps: dict, sub_keys: list)
     )
     agent = build_agent("dqn", vec_env, spec.agent_params, seed=spec.seed)
     curve = InSampleCurve(spec, {k: train_eps[k] for k in sub_keys}, data,
-                          every=spec.total_timesteps // CURVE_POINTS)
+                          every=spec.total_timesteps // CURVE_POINTS, lookup=lookup)
     agent.learn(total_timesteps=spec.total_timesteps, callback=curve)
-    if not curve.points or curve.points[-1][0] < spec.total_timesteps // STEPS_PER_EPISODE:
-        curve.record(agent, spec.total_timesteps)
+    curve.record(agent, spec.total_timesteps)
     return agent, vec_env, curve.points
 
 
-def _train_torch(spec: PolicySpec, data: RunData, train_eps: dict, sub_keys: list):
+def _train_torch(spec: PolicySpec, data: RunData, train_eps: dict, sub_keys: list, lookup: dict):
     """PPO or GRPO on the batched replay; returns (TorchPolicy, curve points)."""
     import torch
 
@@ -300,7 +314,7 @@ def _train_torch(spec: PolicySpec, data: RunData, train_eps: dict, sub_keys: lis
     from src.rl.grpo import train_grpo
     from src.rl.ppo import train_ppo
 
-    arrays = build_episode_arrays(train_eps, data.lookup, spec, data.scales, data.rules)
+    arrays = build_episode_arrays(train_eps, lookup, spec, data.scales, data.rules)
     pos = {k: i for i, k in enumerate(arrays.keys)}
     eval_idx = torch.tensor([pos[k] for k in sub_keys], dtype=torch.long)
     iterations = int(spec.agent_params.get("iterations", 1))
@@ -310,13 +324,14 @@ def _train_torch(spec: PolicySpec, data: RunData, train_eps: dict, sub_keys: lis
 
     def on_iteration(it: int, stats: dict) -> None:
         if it % log_every == 0 or it == iterations:
-            mlflow.log_metrics(stats, step=it)
+            mlflow.log_metrics({k: v for k, v in stats.items() if np.isfinite(v)}, step=it)
         if it % print_every == 0 or it == iterations:
             print(f"[{spec.agent}] iteration {it}/{iterations} · sampled rollouts vs anchor "
-                  f"{stats['train_vs_anchor_pct']:+.2f}% · policy std {stats['policy_std']:.3f}", flush=True)
+                  f"{stats['train_vs_anchor_pct']:+.2f}% · units vs anchor {stats['train_units_vs_anchor_pct']:+.1f}% "
+                  f"· policy std {stats['policy_std']:.3f}", flush=True)
 
-    def on_eval(windows: int, pct: float) -> None:
-        mlflow.log_metric(CURVE_METRIC, pct, step=int(windows))
+    def on_eval(windows: int, pct: float, units: float) -> None:
+        mlflow.log_metrics({CURVE_METRIC: pct, UNITS_METRIC: units}, step=int(windows))
         points.append((int(windows), pct))
         print(f"[{spec.agent}] {windows:>10,} windows · training-sample cost vs anchor {pct:+.2f}%", flush=True)
 
@@ -324,6 +339,12 @@ def _train_torch(spec: PolicySpec, data: RunData, train_eps: dict, sub_keys: lis
     print(f"[{spec.agent}] {name} on {len(arrays):,} training windows, {iterations} iterations", flush=True)
     policy = trainer(spec, arrays, data.rules, seed=spec.seed, eval_idx=eval_idx,
                      on_iteration=on_iteration, on_eval=on_eval)
+    ran = int(policy.meta.get("iterations_run", iterations))
+    mlflow.log_metric("iterations_run", ran)
+    if ran < iterations:
+        p = spec.agent_params
+        print(f"[{spec.agent}] stopped early at iteration {ran} of {iterations}: the training sample had not improved "
+              f"by {p.get('early_stop_min_delta')} pts for {p.get('early_stop_patience')} iterations", flush=True)
     return policy, points
 
 
@@ -343,6 +364,14 @@ def train_agent(
     val_eps = val_eps if val_eps is not None else block_episodes(config, data, "rl_val")
     project_seed = int(config.get("project", {}).get("seed", 42))
     sub_keys = insample_keys(train_eps)
+    # Training may use forecasts with each fit's average error removed; validation never does.
+    train_lookup, bias_factors = data.lookup, None
+    if spec.training_forecasts != "as_is":
+        from src.rl.debias import training_lookup
+
+        train_lookup, bias_factors = training_lookup(
+            data, config, by_class=spec.training_forecasts == "unbiased_by_class"
+        )
 
     tracking.setup_mlflow(config, "rl")
     resolved = data.setup["resolved"]
@@ -372,6 +401,7 @@ def train_agent(
             "rl_val_end": resolved["rl_val_end"],
             "n_train_episodes": len(train_eps),
             "n_insample_windows": len(sub_keys),
+            "training_forecasts": spec.training_forecasts,
             **{f"agent_{k}": v for k, v in spec.agent_params.items()},
         }
         if spec.method == "residual":
@@ -384,11 +414,16 @@ def train_agent(
 
         run_dir = runs_dir(config) / run.info.run_id
         run_dir.mkdir(parents=True, exist_ok=True)
+        if bias_factors is not None:
+            bias_factors.to_csv(run_dir / "training_bias_factors.csv", index=False)
+            print("[train] training forecasts corrected per cell: "
+                  + ", ".join(f"{r.fit}/{r.demand_class} ×{r.factor:.3f}" for r in bias_factors.itertuples()),
+                  flush=True)
         if is_torch_agent(spec.agent):
-            agent, points = _train_torch(spec, data, train_eps, sub_keys)
+            agent, points = _train_torch(spec, data, train_eps, sub_keys, train_lookup)
             agent.save(run_dir / model_file(spec.agent))
         else:
-            agent, vec_env, points = _train_dqn(spec, data, train_eps, sub_keys)
+            agent, vec_env, points = _train_dqn(spec, data, train_eps, sub_keys, train_lookup)
             agent.save(str(run_dir / model_file(spec.agent)))
             vec_env.save(str(run_dir / "vecnormalize.pkl"))
         summary = {"final_insample_vs_anchor_pct": points[-1][1]} if points else {}
@@ -402,6 +437,9 @@ def train_agent(
 
         spec.save(run_dir / "spec.json")
         per_ep.to_parquet(run_dir / "val_episodes.parquet", index=False)
+        # The final weights on the curve's fixed training windows and forecasts, per episode (display only).
+        _, insample_eps = validate(agent, spec, replace(data, lookup=train_lookup), {k: train_eps[k] for k in sub_keys})
+        insample_eps.to_parquet(run_dir / "insample_episodes.parquet", index=False)
         mlflow.log_artifacts(str(run_dir), artifact_path="policy")
 
         return {

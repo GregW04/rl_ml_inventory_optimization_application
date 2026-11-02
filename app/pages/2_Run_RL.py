@@ -25,6 +25,8 @@ from src.rl.spec import (
     CLASS_FEATURES,
     CONTEXT_FEATURES,
     INVENTORY_FEATURES,
+    TRAINING_FORECAST_LABELS,
+    TRAINING_FORECASTS,
     build_spec,
     default_state,
     is_torch_agent,
@@ -104,6 +106,16 @@ st.caption(
     f"weeks before each scored block (the forecast horizon) · {lib.refit_summary(resolved)}."
 )
 lib.render_split_view(pd.DataFrame(record.get("timeline") or []), resolved)
+if lib.run_has_forecasts(run_id):
+    level_id, block_err = lib.run_block_bias(run_id, not lib.test_scores(run_id).empty)
+    if block_err:
+        st.caption(
+            f"Forecast error of `{level_id}` by block: "
+            + ", ".join(f"{b} {v:+.1f}%" for b, v in block_err.items())
+            + " (positive = forecasts too low). Agents trained on forecasts that ran too low can learn to "
+            "order more everywhere; *Training forecasts → unbiased* below removes that. "
+            "Details: **Forecasts → Forecast drift by fit**."
+        )
 with st.expander("Features used by this run"):
     st.json(record.get("features") or {})
 
@@ -155,6 +167,24 @@ if is_torch_agent(agent):
         step=10, key=f"rl_iters_{agent}",
         help="Each iteration replays a batch of training windows and updates the policy.",
     )
+    early_stop = {"early_stop": o3.checkbox(
+        "Stop early on the training sample", value=bool(agent_cfg.get("early_stop", False)), key=f"rl_early_{agent}",
+        help="Iterations become the budget. Training stops once the cost on the fixed training windows behind the "
+        "learning curve hasn't improved by the minimum for the patience, and keeps the weights at the stop. "
+        "Validation is never used.",
+    )}
+    if early_stop["early_stop"]:
+        early_stop["early_stop_patience"] = int(o3.number_input(
+            "Patience (iterations)", min_value=1, max_value=20_000,
+            value=int(agent_cfg.get("early_stop_patience", 400)), step=50, key=f"rl_es_patience_{agent}",
+            help=f"Checked every {int(agent_cfg.get('early_stop_every', 100))} iterations.",
+        ))
+        early_stop["early_stop_min_delta"] = float(o3.number_input(
+            "Minimum improvement (pts)", min_value=0.0, max_value=10.0,
+            value=float(agent_cfg.get("early_stop_min_delta", 0.2)), step=0.05, key=f"rl_es_delta_{agent}",
+            help="An evaluation counts as an improvement only if the training-sample cost vs anchor beats the best "
+            "so far by at least this many percentage points.",
+        ))
     timesteps = None
 else:
     default_steps = int(agent_cfg.get("total_timesteps", 100_000))
@@ -163,6 +193,7 @@ else:
         step=1_000, key=f"rl_steps_{agent}",
     )
     iterations = None
+    early_stop = None
 
 p1, p2 = st.columns(2)
 if method == "residual":
@@ -178,6 +209,15 @@ else:
         float(base_cfg["rl"]["methods"]["raw"]["order_cap_mult"]), 0.25, key="rl_cap",
     )
     floor_frac = None
+default_tf = base_cfg["rl"].get("training_forecasts", "as_is")
+training_forecasts = p1.selectbox(
+    "Training forecasts", list(TRAINING_FORECASTS),
+    index=list(TRAINING_FORECASTS).index(default_tf) if default_tf in TRAINING_FORECASTS else 0,
+    format_func=lambda v: TRAINING_FORECAST_LABELS[v], key="rl_training_forecasts",
+    help="Unbiased: each training fit's average forecast error is removed (per demand class too), so the "
+    "agent cannot learn a year-wide offset such as a growth year's under-forecast. Validation and test "
+    "always use the real forecasts.",
+)
 project_seed = int(base_cfg.get("project", {}).get("seed", 42))
 seeds_txt = p2.text_input(
     "Seeds", ", ".join(str(s) for s in base_cfg["rl"].get("seeds", [project_seed])), key="rl_seeds",
@@ -238,6 +278,7 @@ spec = build_spec(
     total_timesteps=int(timesteps) if timesteps else None,
     iterations=int(iterations) if iterations else None,
     floor_frac=floor_frac, order_cap_mult=cap_mult,
+    training_forecasts=training_forecasts, early_stop=early_stop,
 )
 if is_torch_agent(agent):
     per_it = windows_per_iteration(agent, spec.agent_params)
@@ -288,16 +329,25 @@ else:
             "—" if k == ANCHOR else (f"{x:+.3f} [{lo:+.3f}, {hi:+.3f}]" if pd.notna(lo) else f"{x:+.3f}")
             for k, x, lo, hi in zip(d["kind"], d["delta_mean"], d["delta_ci_lo"], d["delta_ci_hi"])
         ],
+        transfer=lambda d: [
+            "—" if k == ANCHOR or pd.isna(i) else f"{i:+.1f}% → {v:+.1f}%"
+            for k, i, v in zip(d["kind"], d["insample_pct"], d["val_pct"])
+        ],
         beats=lambda d: ["—" if pd.isna(b) else f"{b:.0%}" for b in d["share_beats"]],
+        units=lambda d: ["—" if k == ANCHOR or pd.isna(u) else f"{u:+.1f}%" for k, u in zip(d["kind"], d["units_vs_anchor"])],
+        tf=lambda d: [TRAINING_FORECAST_LABELS.get(v, v) if v else "" for v in d["training_forecasts"]],
     )
     st.dataframe(
-        view[["champion", "candidate", "seeds", "val", "delta", "beats", "class_delta", "state", "anchor",
-              "total_timesteps"]].rename(
+        view[["champion", "candidate", "seeds", "val", "delta", "transfer", "beats", "units", "class_delta", "tf",
+              "state", "anchor", "total_timesteps"]].rename(
             columns={
                 "val": "validation € / SKU-window (mean ± std over seeds)",
                 "delta": "Δ vs anchor (95% CI, project seed)",
+                "transfer": "training sample → validation (Δ vs anchor, mean over seeds)",
                 "beats": "seeds beating anchor",
+                "units": "units vs anchor (validation)",
                 "class_delta": "Δ vs anchor by demand class (project seed)",
+                "tf": "training forecasts",
                 "total_timesteps": "environment steps",
             }
         ),
@@ -305,7 +355,15 @@ else:
     )
     st.caption(
         "Ranked by mean validation cost over seeds; the champion ships its project-seed weights. "
-        "Δ < 0 means cheaper than the anchor. The interval is a paired bootstrap over validation episodes."
+        "Δ < 0 means cheaper than the anchor. The interval is a paired bootstrap over validation episodes. "
+        "Training sample → validation: the final weights on 2,000 fixed training windows, then on validation; "
+        "a large jump means the training gain did not transfer (details on **Inventory & RL**). "
+        "Units vs anchor: how much more (+) or less the project-seed policy ordered than the anchor on the same "
+        "validation windows; a large value is a bet on the demand level ('—' for runs saved before units "
+        "were recorded). "
+        "'RL on …' rows keep the policy only on the demand classes where its configuration beat the anchor on "
+        "validation (summed over seeds) and order the anchor on the rest. That choice is fit on validation, so "
+        "their validation score is optimistic; the test score is the honest check."
     )
 
 # ---------------------------------------------------------------------------
@@ -343,6 +401,7 @@ else:
         f"Δ vs anchor {latest.get('metrics.test_minus_anchor_eur', float('nan')):+.3f} € "
         + (f"(95% CI [{lo:+.3f}, {hi:+.3f}])" if pd.notna(lo) else "")
         + f" · scored {latest['start_time']:%Y-%m-%d %H:%M}"
+        + (f" · RL on {g}, anchor elsewhere" if isinstance(g := latest.get("tags.champion_gate"), str) and g else "")
         + (" · **post-hoc**" if latest.get("tags.post_hoc") == "true" else "")
     )
     st.warning(

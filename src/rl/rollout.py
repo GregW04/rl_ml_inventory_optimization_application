@@ -32,38 +32,46 @@ def rollout(
     lookup: dict,
     demand_scales: dict[tuple[int, int], float],
     rules: VN2Rules,
+    gate: tuple[str, ...] | None = None,
 ) -> tuple[dict[str, float], pd.DataFrame]:
     """
     Run ``policy`` deterministically over every episode.
 
     Returns aggregate KPIs in euros and one row per episode with its scored cost
-    (weeks 3–8), holding and shortage cost over the whole window, and the SKU's demand
-    class at the window start (when the episodes carry it).
+    (weeks 3–8), holding and shortage cost over the whole window, the units it ordered,
+    and the SKU's demand class at the window start (when the episodes carry it).
+
+    ``gate`` (demand classes) keeps ``policy`` only on episodes whose class at the window
+    start is listed; the others, and episodes without a class, order the anchor.
     """
+    base_spec, base_policy = anchor_baseline(spec)
     rows = []
     for (store, product, wstart), ep in episodes.items():
-        env = VN2Env(spec, ep, lookup, demand_scales.get((store, product), 1.0), rules)
+        cls = str(ep.sort_values("date")["demand_class"].iloc[0]) if "demand_class" in ep.columns else None
+        on = gate is None or cls in gate
+        env = VN2Env(spec if on else base_spec, ep, lookup, demand_scales.get((store, product), 1.0), rules)
+        pol = policy if on else base_policy
         obs, _ = env.reset()
         done = False
-        holding = shortage = 0.0
+        holding = shortage = units = 0.0
         info: dict = {}
         while not done:
-            action, _ = policy.predict(obs, deterministic=True)
+            action, _ = pol.predict(obs, deterministic=True)
             obs, _r, terminated, truncated, info = env.step(action)
             holding += rules.holding_cost * float(info.get("leftover", 0))
             shortage += rules.shortage_cost * float(info.get("shortage", 0))
+            units += float(info.get("order_qty", 0))
             done = terminated or truncated
         rows.append(
             {
                 "store": store,
                 "product": product,
                 "window_start": pd.Timestamp(wstart),
-                "demand_class": (
-                    str(ep.sort_values("date")["demand_class"].iloc[0]) if "demand_class" in ep.columns else None
-                ),
+                "demand_class": cls,
                 "cost_eur": float(info.get("scored_cost_eur", 0.0)),
                 "holding_eur": holding,
                 "shortage_eur": shortage,
+                "units": units,
             }
         )
     per_ep = pd.DataFrame(rows)
@@ -95,6 +103,43 @@ def per_class_delta(per_ep: pd.DataFrame) -> dict[str, float]:
         if len(g) and base > 0:
             out[cls] = 100.0 * (float(g["cost_eur"].sum()) / base - 1.0)
     return out
+
+
+def units_vs_anchor(per_ep: pd.DataFrame) -> float | None:
+    """Units ordered against the anchor's on the same episodes, in %; None without unit columns."""
+    if per_ep.empty or not {"units", "anchor_units"} <= set(per_ep.columns):
+        return None
+    base = float(per_ep["anchor_units"].sum())
+    return 100.0 * (float(per_ep["units"].sum()) / base - 1.0) if base > 0 else None
+
+
+def per_class_units(per_ep: pd.DataFrame) -> dict[str, float]:
+    """:func:`units_vs_anchor` per demand class, in display order (empty without classes or units)."""
+    if units_vs_anchor(per_ep) is None or "demand_class" not in per_ep or per_ep["demand_class"].isna().all():
+        return {}
+    out: dict[str, float] = {}
+    for cls in (*DEMAND_CLASSES, UNCLASSIFIED):
+        value = units_vs_anchor(per_ep[per_ep["demand_class"] == cls])
+        if value is not None:
+            out[cls] = value
+    return out
+
+
+def vs_anchor(per_ep: pd.DataFrame, by) -> pd.DataFrame:
+    """
+    Per group of ``by`` (a column name or a series): windows, cost and units against the anchor
+    in %, and the euro difference. Units are NaN for episodes saved before units were recorded.
+    """
+    g = per_ep.groupby(by)
+    cost, base = g["cost_eur"].sum(), g["anchor_cost_eur"].sum()
+    has_units = {"units", "anchor_units"} <= set(per_ep.columns)
+    out = pd.DataFrame({
+        "windows": g.size(),
+        "cost_vs_anchor_pct": 100.0 * (cost / base - 1.0),
+        "units_vs_anchor_pct": 100.0 * (g["units"].sum() / g["anchor_units"].sum() - 1.0) if has_units else np.nan,
+        "delta_eur": cost - base,
+    })
+    return out.replace([np.inf, -np.inf], np.nan).reset_index()
 
 
 def format_class_delta(deltas: dict[str, float]) -> str:

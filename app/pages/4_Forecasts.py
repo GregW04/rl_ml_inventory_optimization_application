@@ -81,12 +81,19 @@ st.pyplot(fig)
 with st.expander("Forecast table"):
     st.dataframe(sku[["date", "target_date", "sales", *[m.id for m in at_h]]], hide_index=True, width="stretch")
 
+# Test-block forecast diagnostics stay hidden until the run's test block has been scored,
+# so nothing about test can steer choices made before that.
+test_scored = not lib.test_scores(run_id).empty
+
 # ---- per-measure scores (CV and out-of-sample RL blocks) ----
 st.subheader("Scores per measure")
+blocks = [("cv", "CV"), ("oos_rl_train", "RL train"), ("oos_rl_val", "RL val")]
+if test_scored:
+    blocks.append(("oos_rl_test", "RL test"))
 rows = []
 for m in measures:
     row = {"measure": m.id}
-    for prefix, name in [("cv", "CV"), ("oos_rl_train", "RL train"), ("oos_rl_val", "RL val"), ("oos_rl_test", "RL test")]:
+    for prefix, name in blocks:
         for metric in ("pinball", "coverage", "rmse"):
             v = run.get(f"metrics.{prefix}_{metric}_{m.id}")
             if v is not None and pd.notna(v):
@@ -100,9 +107,68 @@ if len(scores.columns) > 1:
     st.caption(
         "Coverage is the share of weeks with demand ≤ the quantile; it should be close to τ. "
         "RL-block scores are out of sample (forecasts from a fit that ends before each block)."
+        + ("" if test_scored else " Test-block scores appear once this run's test block has been scored.")
     )
 else:
     st.caption("This run logged no per-measure scores (it predates measure manifests).")
+
+# ---- forecast drift per fit and per week ----
+st.subheader("Forecast drift by fit")
+drift_data = lib.run_drift(run_id, test_scored)
+fits = drift_data.get("fits", pd.DataFrame())
+if fits.empty:
+    st.caption("Drift needs the run's saved forecasts and its period setup.")
+else:
+    st.dataframe(fits.round(3), hide_index=True, width="stretch")
+    level = drift_data.get("level")
+    weekly = drift_data.get("weekly", pd.DataFrame())
+    if not weekly.empty:
+        import altair as alt
+
+        from src.forecasting.drift import TRIGG_LIMIT
+
+        present = [b for b in lib._BLOCK_COLORS if b in set(weekly["block"])]
+        color = alt.Color("block:N", title="Block", sort=present,
+                          scale=alt.Scale(domain=present, range=[lib._BLOCK_COLORS[b] for b in present]))
+        tooltip = [alt.Tooltip("date:T", title="Week"), "fit:N",
+                   alt.Tooltip("bias_pct:Q", title="Error %", format="+.1f"),
+                   alt.Tooltip("tracking_signal:Q", title="Tracking signal", format="+.2f")]
+        bars = alt.Chart(weekly).mark_bar().encode(
+            x=alt.X("date:T", title=None),
+            y=alt.Y("bias_pct:Q", title=f"Weekly error of {level}, %"),
+            color=color, tooltip=tooltip,
+        ).properties(height=180)
+        signal = alt.Chart(weekly).mark_line(point=True, color="#4C78A8").encode(
+            x=alt.X("date:T", title="Week"),
+            y=alt.Y("tracking_signal:Q", title="Tracking signal", scale=alt.Scale(domain=[-1, 1])),
+            tooltip=tooltip,
+        ).properties(height=160)
+        limits = alt.Chart(pd.DataFrame({"y": [-TRIGG_LIMIT, TRIGG_LIMIT]})).mark_rule(
+            strokeDash=[4, 4], color="gray").encode(y="y:Q")
+        alarms = alt.Chart(weekly[weekly["alarm"]]).mark_point(color="#E45756", size=80, filled=True).encode(
+            x="date:T", y="tracking_signal:Q", tooltip=tooltip)
+        st.altair_chart(alt.vconcat(bars, signal + limits + alarms).resolve_scale(x="shared"), width="stretch")
+        n_alarm = int(weekly["alarm"].sum())
+        st.caption(
+            "Error = (actual − forecast) ÷ actual, summed over all SKUs: positive means the forecasts were "
+            "too low. The tracking signal is Trigg's smoothed error ÷ smoothed absolute error (smoothing 0.2); "
+            f"beyond ±{TRIGG_LIMIT} (red points, {n_alarm} week{'s' if n_alarm != 1 else ''}) recent errors "
+            "point the same way more often than noise would in about 95% of weeks. It catches a sustained "
+            "shift of one weekly-error standard deviation in about 6 weeks, half of one in about 12."
+        )
+    by_class = drift_data.get("by_class", pd.DataFrame())
+    col = f"bias {level} (%)"
+    if not by_class.empty and col in by_class.columns:
+        with st.expander(f"Error of {level} by demand class"):
+            table = by_class.pivot_table(index="fit", columns="demand class", values=col, sort=False)
+            st.dataframe(table.round(1), width="stretch")
+            st.caption("Demand pattern of each SKU that week, from its trailing 52 weeks of sales.")
+    st.caption(
+        "One row per forecaster fit. Only targets inside the fit's own block count, and out-of-stock weeks are "
+        "skipped. A learned policy trained on a block whose forecasts ran too low can learn to order more "
+        "everywhere, which costs money once the error flips sign."
+        + ("" if test_scored else " The test fit is hidden until this run's test block has been scored.")
+    )
 
 # ---- feature importance ----
 st.subheader("Feature importance")

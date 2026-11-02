@@ -20,6 +20,13 @@ class Batch:
     rewards: torch.Tensor  # [R, M] negative euro cost credited to each decision
     cost: torch.Tensor     # [M] scored cost of the rollout (weeks 3-8)
     shadow: torch.Tensor   # [M] the anchor's scored cost on the same window
+    units: torch.Tensor    # [M] units the policy ordered
+    shadow_units: torch.Tensor  # [M] units the shadow anchor ordered
+
+    def units_vs_anchor_pct(self) -> float:
+        """Units ordered against the shadow anchor, in %."""
+        base = float(self.shadow_units.sum())
+        return 100.0 * (float(self.units.sum()) / base - 1.0) if base > 0 else 0.0
 
 
 def collect(
@@ -45,6 +52,8 @@ def collect(
     rewards = torch.zeros(rounds, m)
     cost = torch.zeros(m, dtype=torch.float64)
     shadow = torch.zeros(m, dtype=torch.float64)
+    units = torch.zeros(m, dtype=torch.float64)
+    shadow_units = torch.zeros(m, dtype=torch.float64)
     for t in range(env.weeks):
         if t < rounds:
             with torch.no_grad():
@@ -64,14 +73,38 @@ def collect(
         rewards[min(t, rounds - 1)] += r.to(torch.float32)
         cost += c
         shadow += sh
+        units += env.last_order
+        shadow_units += env.last_shadow_order
         obs = nxt
-    return Batch(torch.stack(obs_l), torch.stack(act_l), torch.stack(logp_l), rewards, cost, shadow)
+    return Batch(torch.stack(obs_l), torch.stack(act_l), torch.stack(logp_l), rewards, cost, shadow,
+                 units, shadow_units)
 
 
-def evaluate_actor(env: BatchVN2Env, actor: Actor, idx: torch.Tensor) -> tuple[float, float]:
-    """(policy cost, anchor cost) summed over ``idx`` with deterministic actions."""
+def evaluate_actor(env: BatchVN2Env, actor: Actor, idx: torch.Tensor) -> tuple[float, float, float]:
+    """(policy cost, anchor cost, units vs anchor %) over ``idx`` with deterministic actions."""
     b = collect(env, actor, idx, None, stochastic=False)
-    return float(b.cost.sum()), float(b.shadow.sum())
+    return float(b.cost.sum()), float(b.shadow.sum()), b.units_vs_anchor_pct()
+
+
+class EarlyStop:
+    """
+    Stop rule on the training sample's cost vs anchor (lower is better). An evaluation is an
+    improvement only if it beats the best so far by at least ``min_delta`` points; training
+    stops once ``patience`` iterations pass without one. The caller keeps the weights at the
+    stop, so no earlier checkpoint is ever picked.
+    """
+
+    def __init__(self, patience: int, min_delta: float):
+        if int(patience) < 1:
+            raise ValueError("Early stopping needs a patience of at least 1 iteration.")
+        self.patience, self.min_delta = int(patience), float(min_delta)
+        self.best, self.best_it = float("inf"), 0
+
+    def should_stop(self, it: int, value: float) -> bool:
+        """Record the evaluation at iteration ``it``; True once ``patience`` has run out."""
+        if value < self.best - self.min_delta:
+            self.best, self.best_it = value, it
+        return it - self.best_it >= self.patience
 
 
 def raw_init_mean(env: BatchVN2Env, sample: int = 20_000, seed: int = 0) -> float:

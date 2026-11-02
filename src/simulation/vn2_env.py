@@ -167,8 +167,8 @@ class VN2Env(gym.Env):
         self._decide(fc)
         return self._obs(fc), {"demand_scale": self.demand_scale}
 
-    def resolve_order(self, action) -> float:
-        """Order quantity for ``action`` in the current round."""
+    def unrounded_order(self, action) -> float:
+        """Order for ``action`` in the current round, before rounding and the floor at zero."""
         if self.spec.agent == "dqn":
             f = float(self.spec.buckets[int(np.asarray(action).reshape(-1)[0])])
         else:
@@ -176,10 +176,13 @@ class VN2Env(gym.Env):
         if self.spec.method == "raw":
             if self.spec.agent != "dqn":
                 f = (f + 1.0) / 2.0
-            return float(max(0, round(f * self.spec.order_cap_mult * self.demand_scale)))
+            return f * self.spec.order_cap_mult * self.demand_scale
         anchor_q = float(self._decision.order)
-        step = max(anchor_q, self.spec.floor_frac * self.demand_scale)
-        return float(max(0, round(anchor_q + f * step)))
+        return anchor_q + f * max(anchor_q, self.spec.floor_frac * self.demand_scale)
+
+    def resolve_order(self, action) -> float:
+        """Order quantity for ``action`` in the current round."""
+        return float(max(0, round(self.unrounded_order(action))))
 
     def step(self, action) -> tuple[np.ndarray, float, bool, bool, dict]:
         fc = self._get_fc()

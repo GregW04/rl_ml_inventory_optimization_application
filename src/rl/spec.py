@@ -27,6 +27,19 @@ AGENT_LABELS = {
     "grpo": "GRPO · groups of rollouts per window",
 }
 STEPS_PER_EPISODE = 8  # one VN2 window: 6 order rounds + 2 delivery weeks
+# PPO / GRPO early stopping on the training sample (src.rl.batch_rollout.EarlyStop). A spec
+# carries these only when early stopping is on.
+EARLY_STOP_KEYS = ("early_stop", "early_stop_patience", "early_stop_min_delta", "early_stop_every")
+
+# Forecasts the agent trains on (validation and test always use the real ones). The
+# unbiased options remove each training fit's average forecast error (see src.rl.debias),
+# so a year-wide error such as a growth year's under-forecast cannot be learned as an offset.
+TRAINING_FORECASTS = ("as_is", "unbiased", "unbiased_by_class")
+TRAINING_FORECAST_LABELS = {
+    "as_is": "As forecast",
+    "unbiased": "Unbiased per fit",
+    "unbiased_by_class": "Unbiased per fit and demand class",
+}
 
 INVENTORY_FEATURES: tuple[str, ...] = ("on_hand", "in_transit_w1", "in_transit_w2")
 ANCHOR_FEATURES: tuple[str, ...] = ("anchor_order", "projected_stock", "projected_lost")
@@ -82,6 +95,8 @@ class PolicySpec:
     # Agent hyperparameters (``rl.agents.<agent>`` at training time), so the spec and
     # its config_key capture everything that shapes the policy.
     agent_params: dict = field(default_factory=dict)
+    # One of TRAINING_FORECASTS; specs saved before it existed load as "as_is".
+    training_forecasts: str = "as_is"
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -106,6 +121,9 @@ class PolicySpec:
         d = self.to_dict()
         d.pop("seed", None)
         d.pop("order_cap_mult" if self.method == "residual" else "floor_frac", None)
+        # Left out at its default, so keys of runs saved before the option existed still match.
+        if d.get("training_forecasts") == "as_is":
+            d.pop("training_forecasts")
         payload = json.dumps(d, sort_keys=True, default=str)
         return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
@@ -113,7 +131,8 @@ class PolicySpec:
         return replace(self, seed=int(seed))
 
     def label(self) -> str:
-        return f"{self.method} · {self.agent.upper()} · {len(self.state)} features"
+        base = f"{self.method} · {self.agent.upper()} · {len(self.state)} features"
+        return base if self.training_forecasts == "as_is" else f"{base} · {self.training_forecasts}"
 
 
 def validate_spec(spec: PolicySpec, measure_ids: list[str]) -> list[str]:
@@ -140,10 +159,17 @@ def validate_spec(spec: PolicySpec, measure_ids: list[str]) -> list[str]:
         errors.append(f"Anchor inputs not in this forecasting run: {missing_anchor}.")
     if spec.agent == "dqn" and not spec.buckets:
         errors.append("DQN needs a list of action buckets.")
+    if spec.training_forecasts not in TRAINING_FORECASTS:
+        errors.append(f"Training forecasts must be one of {list(TRAINING_FORECASTS)}.")
+    elif spec.training_forecasts != "as_is" and not {"mean_h0", "mean_h1"} & set(measure_ids):
+        errors.append("Unbiased training forecasts need a mean forecast at h0 or h1 (mean_h0 / mean_h1).")
     if spec.agent in TORCH_AGENTS:
         # Missing keys fall back to the trainer's defaults; values that are present must be valid.
         p = spec.agent_params
-        for key in ("iterations", "batch_windows", "epochs", "minibatch_size"):
+        positive = ("iterations", "batch_windows", "epochs", "minibatch_size")
+        if p.get("early_stop"):
+            positive += ("early_stop_patience", "early_stop_every")
+        for key in positive:
             if key not in p:
                 continue
             try:
@@ -174,11 +200,16 @@ def build_spec(
     floor_frac: float | None = None,
     order_cap_mult: float | None = None,
     seed: int | None = None,
+    training_forecasts: str = "as_is",
+    early_stop: dict | None = None,
 ) -> PolicySpec:
     """Spec with action parameters and agent hyperparameters filled from the config.
 
     DQN's budget is ``total_timesteps``. PPO and GRPO budget in ``iterations`` (each one
     replays a batch of windows); their ``total_timesteps`` is derived so budgets compare.
+    ``early_stop`` overrides the config's ``EARLY_STOP_KEYS`` for PPO / GRPO; with early
+    stopping off they are left out, so configuration keys of runs saved before the option
+    existed still match.
     """
     mcfg = config["rl"]["methods"][method]
     params = dict(config["rl"]["agents"][agent])
@@ -186,6 +217,10 @@ def build_spec(
         params.pop("total_timesteps", None)
         if iterations is not None:
             params["iterations"] = int(iterations)
+        params.update(early_stop or {})
+        if not params.get("early_stop"):
+            for key in EARLY_STOP_KEYS:
+                params.pop(key, None)
         steps = torch_env_steps(agent, params)
     else:
         steps = int(total_timesteps or params.pop("total_timesteps", 100_000))
@@ -204,4 +239,5 @@ def build_spec(
         seed=int(seed if seed is not None else config.get("project", {}).get("seed", 42)),
         total_timesteps=steps,
         agent_params=params,
+        training_forecasts=training_forecasts,
     )

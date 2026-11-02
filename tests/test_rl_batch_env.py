@@ -111,6 +111,29 @@ def test_shadow_anchor_equals_the_anchor_rollout():
     assert cost_b == pytest.approx(shadow, abs=1e-12)  # residual 0 is the anchor
 
 
+def test_units_ordered_match_vn2env():
+    from src.rl.batch_rollout import collect
+    from src.rl.policy import Actor
+
+    episodes, lookup, scales = _synthetic(seed=4)
+    spec = _spec("residual")
+    actor = Actor(len(STATE), (8,))
+    torch.nn.init.normal_(actor.head.weight, std=0.5)          # a policy that moves away from the anchor
+    arrays = build_episode_arrays(episodes, lookup, spec, scales, RULES)
+    b = collect(BatchVN2Env(spec, arrays, RULES), actor, torch.arange(len(arrays)), None, stochastic=False)
+
+    class _Wrapped:
+        def predict(self, obs, deterministic=True):
+            with torch.no_grad():
+                return np.clip(actor(torch.as_tensor(obs, dtype=torch.float32).reshape(1, -1)).numpy(), -1, 1), None
+
+    _, per_ep = rollout(_Wrapped(), spec, episodes, lookup, scales, RULES)
+    _, anchor_ep = rollout(ZeroResidual(), spec, episodes, lookup, scales, RULES)
+    assert b.units.numpy() == pytest.approx(per_ep["units"].to_numpy(), abs=1e-9)
+    assert b.shadow_units.numpy() == pytest.approx(anchor_ep["units"].to_numpy(), abs=1e-9)
+    assert b.units_vs_anchor_pct() != 0.0
+
+
 def test_poisson_target_anchor():
     episodes, lookup, scales = _synthetic(seed=5)
     for f in lookup.values():

@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import mlflow
+import pandas as pd
 import pytest
 
 from src.rl import evaluate as rl_eval
@@ -25,8 +26,11 @@ ROOT = get_project_root()
     not (ROOT / "artifacts" / "forecasts" / "forecast_setup.json").exists(),
     reason="needs a forecasting run on disk",
 )
-@pytest.mark.parametrize("agent", ["dqn", "ppo", "grpo"])
-def test_train_validate_select_and_lock_test(tmp_path: Path, monkeypatch, agent: str):
+@pytest.mark.parametrize(
+    ("agent", "training_forecasts"),
+    [("dqn", "as_is"), ("ppo", "unbiased_by_class"), ("grpo", "as_is")],
+)
+def test_train_validate_select_and_lock_test(tmp_path: Path, monkeypatch, agent: str, training_forecasts: str):
     config = load_config()
     db = f"sqlite:///{tmp_path / 'mlruns.db'}"
     config["rl"]["mlflow"]["tracking_uri"] = db
@@ -49,6 +53,7 @@ def test_train_validate_select_and_lock_test(tmp_path: Path, monkeypatch, agent:
         config, str(data.run_id), "residual", agent,
         default_state("residual", data.measure_ids), data.default_anchor,
         total_timesteps=300 if agent == "dqn" else None, iterations=None if agent == "dqn" else 2,
+        training_forecasts=training_forecasts,
     )
     if agent == "dqn":
         spec.agent_params["learning_starts"] = 50
@@ -60,17 +65,33 @@ def test_train_validate_select_and_lock_test(tmp_path: Path, monkeypatch, agent:
     assert len({r["config_key"] for r in results}) == 1
     for r in results:
         run_dir = Path(r["run_dir"])
-        assert {model_file(agent), "spec.json", "val_episodes.parquet"} <= {p.name for p in run_dir.iterdir()}
+        files = {p.name for p in run_dir.iterdir()}
+        assert {model_file(agent), "spec.json", "val_episodes.parquet", "insample_episodes.parquet"} <= files
         assert "val_anchor_cost_eur_per_sku" in r and "final_insample_vs_anchor_pct" in r
+        assert "val_units_vs_anchor_pct" in r
+        assert (run_dir / "training_bias_factors.csv").exists() == (training_forecasts != "as_is")
+        # The saved training-sample episodes are the curve's last point, on the final weights.
+        ins = pd.read_parquet(run_dir / "insample_episodes.parquet")
+        pct = 100.0 * (ins["cost_eur"].sum() / ins["anchor_cost_eur"].sum() - 1.0)
+        assert pct == pytest.approx(r["final_insample_vs_anchor_pct"], abs=1e-6)
+        history = mlflow.tracking.MlflowClient().get_metric_history(r["rl_run_id"], "insample_units_vs_anchor_pct")
+        assert len(history) >= 2
 
     board = leaderboard(config, str(data.run_id))
-    rl_row = board[board["kind"] == "rl"].iloc[0]
+    rl_row = board[(board["kind"] == "rl") & board["gate"].isna()].iloc[0]
     assert rl_row["n_seeds"] == 2 and rl_row["deploy_run_id"] == results[0]["rl_run_id"]
+    assert rl_row["training_forecasts"] == training_forecasts and pd.notna(rl_row["units_vs_anchor"])
+    assert pd.notna(rl_row["insample_pct"]) and pd.notna(rl_row["val_pct"]) and pd.notna(rl_row["val_pct_sd"])
     assert set(board["kind"]) == {"rl", "anchor"}
-    assert champion(board) is not None
+    # A gated candidate exists only when the configuration won some demand classes and lost others.
+    for _, g in board[board["gate"].notna()].iterrows():
+        assert g["config_key"] == f"{rl_row['config_key']}+gate" and g["val_mean"] <= rl_row["val_mean"]
+    champ = champion(board)
+    assert champ is not None
 
     first = rl_eval.score_test(config, str(data.run_id))
     assert blocks[-1] == "rl_test" and first["post_hoc"] is False
+    assert first["gate"] == (champ["gate"] if champ["kind"] == "rl" else None)
     with pytest.raises(rl_eval.LockedTestError):
         rl_eval.score_test(config, str(data.run_id))
     again = rl_eval.score_test(config, str(data.run_id), override_lock=True)
