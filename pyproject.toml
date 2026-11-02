@@ -1,0 +1,67 @@
+[project]
+name = "rl-ml-inventory-optimization"
+version = "0.1.0"
+description = "VN2 inventory optimisation: demand forecasting, lost-sales anchor, residual RL and an MLOps loop on MLflow"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+# Direct dependencies pinned to the minor versions the test suite runs on (`~=` allows patches);
+# uv.lock pins every package exactly. The forecasting pipeline must stay torch-free (LightGBM and
+# torch segfault in one process on macOS), so torch lives in the `rl` extra.
+dependencies = [
+    "mlflow==3.14.0",  # exact: the SQLite schema must match the MLflow that serves it
+    "pandas~=2.3.3",
+    "numpy~=2.4.4",
+    "scipy~=1.17.1",
+    "pyarrow~=23.0.1",
+    "pyyaml~=6.0.3",
+    "joblib~=1.5.3",
+    "matplotlib~=3.10.9",
+    "scikit-learn~=1.8.0",
+    "lightgbm~=4.6.0",
+    "xgboost~=3.2.0",
+    "catboost~=1.2.10",
+    "optuna~=4.8.0",
+    "gymnasium~=1.2.3",
+]
+
+[project.optional-dependencies]
+rl = ["torch~=2.12.0"]
+app = ["streamlit~=1.58.0", "altair~=6.2.1"]
+notebooks = ["jupyter>=1.1", "ipykernel>=7.2", "seaborn>=0.13"]
+dev = ["pytest~=9.1.1", "ruff==0.17.1", "pre-commit~=4.7.0"]
+
+# CPU-only torch wheels on Linux (CI); macOS uses PyPI's wheels.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "slow: long end-to-end test (deselect with -m 'not slow')",
+    "needs_local_run: needs a forecasting run in the local artifact cache (skipped in CI)",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = ["notebooks"]
+
+[tool.ruff.lint]
+# Explicit rule set, so results don't change with ruff's defaults: pyflakes and core errors,
+# import order, pyupgrade, bugbear.
+select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
+# B905 (zip(strict=)) would change behaviour on length mismatches; left to a deliberate pass.
+ignore = ["B905"]
+
+[tool.ruff.lint.per-file-ignores]
+# Streamlit pages put the repo root on sys.path before importing project modules.
+"app/**" = ["E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src", "app"]

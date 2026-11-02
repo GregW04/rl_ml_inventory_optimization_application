@@ -14,7 +14,6 @@ mlflow:
 project:
   name: rl-ml-inventory-optimization
   seed: 42
-  frequency: W  # weekly (ISO week, Monday-aligned in VN2 data)
 
 vn2:
   holding_cost: 0.2
@@ -31,12 +30,6 @@ data:
   master_file: Week0-Master.csv
   initial_state_file: Week0-2024-04-08-Initial State.csv
   initial_state_date: "2024-04-08"
-  id_cols:
-    - store
-    - product
-  date_col: date
-  target_col: sales
-  instock_col: in_stock
 
 forecasting:
   features:

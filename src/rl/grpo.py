@@ -18,7 +18,7 @@ stops once the training sample stops improving; the weights at the stop are kept
 from __future__ import annotations
 
 import copy
-from typing import Callable
+from collections.abc import Callable
 
 import torch
 from torch.distributions import kl_divergence

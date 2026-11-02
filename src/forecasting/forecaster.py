@@ -2,19 +2,16 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
+import joblib
 import numpy as np
 import pandas as pd
-
-from pathlib import Path
-
-import joblib
 
 from src.forecasting.measures import HORIZONS, Measure, parse_measures
 from src.forecasting.model import _BaseForecaster, inverse_values, transform_values
 from src.utils.metrics import quantile_loss
-
 
 MEAN_OBJECTIVES: tuple[str, ...] = ("poisson", "tweedie")
 ENSEMBLE = "ensemble"
@@ -85,7 +82,7 @@ class MeasureForecaster(_BaseForecaster):
     # ------------------------------------------------------------------
 
     def _make(self, kind: str, tau: float | None) -> Any:
-        from src.forecasting.registry import get_spec
+        from src.forecasting.estimators import get_spec
 
         spec = get_spec(self.model_name)
         params = self._runtime_params()

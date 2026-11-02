@@ -17,13 +17,6 @@ import pytest
 from src.utils.config import load_config
 
 
-def pytest_configure(config):
-    config.addinivalue_line("markers", "slow: long end-to-end test (deselect with -m 'not slow')")
-    config.addinivalue_line(
-        "markers", "needs_local_run: needs a forecasting run in the local artifact cache (skipped in CI)"
-    )
-
-
 @pytest.fixture(autouse=True)
 def isolated_mlflow(tmp_path_factory, monkeypatch):
     store = tmp_path_factory.mktemp("mlflow")

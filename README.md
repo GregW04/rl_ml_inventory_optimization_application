@@ -10,11 +10,17 @@ Everything is wired through a **single MLflow store** and a **Streamlit app** so
 
 ## Setup
 
+Dependencies are declared in `pyproject.toml` and pinned exactly in `uv.lock`
+(`requirements.txt` is exported from the lock for pip users).
+
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+uv sync --extra rl --extra app --extra dev   # creates .venv from uv.lock
+uv run pre-commit install                    # ruff + large-file guard on every commit
+uv run pytest -m "not slow"                  # what CI runs (plus lint); -m slow adds the protocol tests
 ```
+
+The forecasting pipeline needs only the core dependencies; `rl` adds torch, `app` adds Streamlit.
+Keep them in separate processes: LightGBM and torch segfault in one process on macOS.
 
 ## Project layout
 
@@ -23,7 +29,7 @@ configs/config.yaml      # single source of truth
 src/forecasting/         # preprocessing, features, validation, model, pipeline
 src/simulation/          # VN2 replay engine, lost-sales anchor, RL environment
 src/rl/                  # policy spec, batched replay, PPO / GRPO training, selection, test scoring
-src/utils/               # metrics, config, and tracking.py (all MLflow access)
+src/utils/               # metrics, config, and tracking.py (MLflow setup, provenance, artifact cache)
 app/                     # Streamlit frontend (Home + 5 pages)
 notebooks/               # EDA and pipeline demos
 docs/mlflow.md           # MLflow + tracking-utility guide
@@ -35,7 +41,7 @@ data/                    # VN2 competition CSVs
 ### Option A — the app (recommended)
 
 ```bash
-streamlit run app/Home.py
+make app        # starts the MLflow server (make mlflow-server) and Streamlit against it
 ```
 
 One UI to **trigger runs**, **browse & compare** MLflow runs, view **forecasts** (actual vs
@@ -65,24 +71,27 @@ python -m src.rl.evaluate --config configs/config.yaml --forecast-run <run_id>
 
 ## MLflow
 
-All runs (forecasting **and** RL) log to one canonical store defined in
-`configs/config.yaml`:
+All runs (forecasting **and** RL) log to one store defined in `configs/config.yaml`:
 
 ```yaml
 mlflow:
-  tracking_uri: sqlite:///mlruns.db   # resolved to an ABSOLUTE path at runtime
+  tracking_uri: sqlite:///mlruns.db   # resolved to an absolute path; MLFLOW_TRACKING_URI overrides it
+  experiments: {forecasting: vn2-demand-forecasting, rl: vn2-inventory-rl}
+  cache_dir: artifacts/cache          # local copy of run artifacts, one folder per run id
 ```
 
-The tracking URI is resolved to an absolute path rooted at the project directory by
-`src/utils/tracking.py:setup_mlflow`, so **every entry point — CLI, notebook, or app —
-writes to the same `mlruns.db` regardless of the working directory**. Browse it with:
+Day to day, a local tracking server sits on top of that SQLite file; the app and CLI jobs reach it through
+`MLFLOW_TRACKING_URI`:
 
 ```bash
-mlflow ui --backend-store-uri sqlite:///mlruns.db
+make mlflow-server                                  # http://127.0.0.1:5050 (UI + API), project venv's mlflow
+export MLFLOW_TRACKING_URI=http://127.0.0.1:5050    # for CLI jobs in this shell (also in .env)
+make backup                                         # consistent online copy of mlruns.db
 ```
 
-Experiments: `vn2-demand-forecasting` and `vn2-inventory-rl`. See
-[docs/mlflow.md](docs/mlflow.md) for what each run logs and the `tracking.py` API.
+Every run records its git commit, whether the code had uncommitted changes, and the effective config.
+See [docs/mlflow.md](docs/mlflow.md) for what each run logs, the artifact cache, the legacy-run archive
+and the `tracking.py` API.
 
 ## Architecture
 

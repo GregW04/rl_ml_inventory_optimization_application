@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "experiment/**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+      - run: uvx ruff@0.17.1 check src app tests
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.12"
+      - name: Install from the lock file (CPU torch on Linux)
+        run: uv sync --locked --extra rl --extra app --extra dev
+      # Every test runs against its own temp MLflow store (tests/conftest.py). Tests that need a
+      # real forecasting run from the local artifact cache, and the slow end-to-end protocol
+      # tests, run on the development machine only.
+      - name: Tests
+        run: uv run --no-sync pytest -m "not slow and not needs_local_run" -q

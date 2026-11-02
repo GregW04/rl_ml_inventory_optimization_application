@@ -175,7 +175,8 @@ def build_vn2_episodes(
                 burn_dates = [pd.Timestamp(d) for d in burn_hist["date"].tolist()]
                 st, pr = int(store), int(product)
 
-                def _burn_order(r: int, s, _c: dict) -> int:
+                # Called right away by burn_in_initial_state; the defaults bind this window's values.
+                def _burn_order(r: int, s, _c: dict, burn_dates=burn_dates, st=st, pr=pr) -> int:
                     d = burn_dates[min(r - 1, len(burn_dates) - 1)]
                     fc = forecast_lookup.get((st, pr, d), {})
                     return anchor_order_fn(r, s, {"fc": fc})

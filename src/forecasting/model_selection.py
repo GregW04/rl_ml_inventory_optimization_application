@@ -19,10 +19,10 @@ import logging
 import numpy as np
 import pandas as pd
 
+from src.forecasting.estimators import available_candidates
 from src.forecasting.forecaster import MeasureForecaster
 from src.forecasting.measures import primary_measure, primary_metric_name
 from src.forecasting.model import get_feature_columns
-from src.forecasting.registry import available_candidates
 from src.forecasting.validation import get_unique_dates, make_folds
 
 logger = logging.getLogger(__name__)

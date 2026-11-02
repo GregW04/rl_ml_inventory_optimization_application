@@ -1,0 +1,15 @@
+# Install once with `uv run pre-commit install`; runs on every commit.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.1  # keep equal to the ruff pin in pyproject.toml
+    hooks:
+      - id: ruff-check
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      # The MLflow DB, model files and thesis PDFs must never land in git.
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]

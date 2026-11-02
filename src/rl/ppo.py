@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import copy
 import itertools
-from typing import Callable
+from collections.abc import Callable
 
 import torch
 from torch.distributions import kl_divergence

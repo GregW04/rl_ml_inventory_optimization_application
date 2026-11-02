@@ -76,7 +76,7 @@ class TorchPolicy:
         torch.save({"state_dict": self.actor.state_dict(), "meta": self.meta}, str(path))
 
     @classmethod
-    def load(cls, path: str | Path) -> "TorchPolicy":
+    def load(cls, path: str | Path) -> TorchPolicy:
         blob = torch.load(str(path), map_location="cpu", weights_only=True)
         meta = blob["meta"]
         actor = Actor(int(meta["obs_dim"]), tuple(meta["hidden"]))

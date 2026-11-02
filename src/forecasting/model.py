@@ -93,7 +93,7 @@ class _BaseForecaster:
         model_name: str = "lightgbm",
         model_params: dict | None = None,
     ):
-        from src.forecasting.registry import get_spec
+        from src.forecasting.estimators import get_spec
 
         self.config = config
         self.model_name = model_name
@@ -228,7 +228,7 @@ class _BaseForecaster:
         joblib.dump(self._payload(), path)
 
     @classmethod
-    def load(cls, path: str | Path) -> "_BaseForecaster":
+    def load(cls, path: str | Path) -> _BaseForecaster:
         payload = joblib.load(path)
         forecaster = cls(
             payload["config"],
