@@ -15,10 +15,12 @@ import tempfile
 from pathlib import Path
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import mlflow
 import pandas as pd
+from mlflow.exceptions import MlflowException
 
 from src.rl.rollout import (
     ZeroResidual,
@@ -41,9 +43,9 @@ class LockedTestError(RuntimeError):
 
 def scored_test_runs(config: dict, forecast_run_id: str) -> pd.DataFrame:
     """Finished test scorings (``stage=test``) of a forecasting run, newest first."""
-    tracking.init_tracking(config, "rl")
+    tracking.init_tracking(config)
     return tracking.search_runs(
-        config["rl"]["mlflow"]["experiment_name"],
+        tracking.experiment_name(config, "rl"),
         filter_string=(
             f"tags.stage = 'test' and tags.forecast_run_id = '{forecast_run_id}' "
             "and attributes.status = 'FINISHED'"
@@ -51,15 +53,18 @@ def scored_test_runs(config: dict, forecast_run_id: str) -> pd.DataFrame:
     )
 
 
-def legacy_test_runs(config: dict, forecast_run_id: str) -> pd.DataFrame:
-    """Test-block evaluations logged before the lock existed (``policy_evaluation`` runs)."""
-    tracking.init_tracking(config, "rl")
-    return tracking.search_runs(
-        config["rl"]["mlflow"]["experiment_name"],
-        filter_string=(
-            f"tags.mlflow.runName = 'policy_evaluation' and params.forecast_run_id = '{forecast_run_id}'"
-        ),
-    )
+def legacy_test_evaluations(config: dict, forecast_run_id: str) -> int:
+    """
+    How often the test block was evaluated before the lock existed. Those ``policy_evaluation``
+    runs were archived on 2026-11-02; their count lives on as the forecasting run's
+    ``legacy_test_evaluations`` tag.
+    """
+    tracking.init_tracking(config)
+    try:
+        tags = mlflow.get_run(forecast_run_id).data.tags
+    except MlflowException:
+        return 0
+    return int(tags.get("legacy_test_evaluations", 0))
 
 
 def _anchor_spec(data: RunData) -> PolicySpec:
@@ -104,8 +109,8 @@ def score_test(
             "the new score is tagged post_hoc."
         )
     # The test block was already seen if it was scored before the lock existed, too.
-    legacy = legacy_test_runs(config, forecast_run_id)
-    post_hoc = not previous.empty or not legacy.empty
+    legacy = legacy_test_evaluations(config, forecast_run_id)
+    post_hoc = not previous.empty or legacy > 0
     data = load_run_data(config, forecast_run_id)
     chosen, spec, policy, row, gate = _pick(config, data, champion_id)
     episodes = block_episodes(config, data, "rl_test")
@@ -153,8 +158,9 @@ def score_test(
             "champion_config_key": ANCHOR if chosen == ANCHOR else spec.config_key() + ("+gate" if gate else ""),
             "champion_gate": ", ".join(gate) if gate else "",
             "post_hoc": str(post_hoc).lower(),
-            "legacy_test_evaluations": str(len(legacy)),
+            "legacy_test_evaluations": str(legacy),
         })
+        tracking.log_provenance(config)
         mlflow.log_params({
             "champion": chosen,
             "method": "anchor" if chosen == ANCHOR else spec.method,
@@ -182,7 +188,7 @@ def _log_comparison_chart(chosen: str, metrics: dict) -> None:
            color=["#F58518", "#4C78A8"])
     ax.set_ylabel("Test cost (€ per SKU-window)")
     ax.set_title("Test block (production) — lower is better")
-    tracking.log_figure(fig, artifact_path="test")
+    tracking.log_figure(fig, "test", "test_vs_anchor.png")
 
 
 def main() -> None:

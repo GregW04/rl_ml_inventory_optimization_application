@@ -26,7 +26,7 @@ from src.forecasting.measures import (
 )
 from src.forecasting.periods import (
     current_setup_hash,
-    load_setup,
+    load_run_setup,
     lookback_breakdown,
     panel_weeks,
     periods_to_dict,
@@ -42,7 +42,7 @@ st.caption(
 )
 
 base_cfg = lib.get_config()
-latest_setup = load_setup(base_cfg)
+latest_setup = load_run_setup(base_cfg, None)  # newest finished forecasting run
 
 
 def _form_defaults(record: dict | None) -> dict:

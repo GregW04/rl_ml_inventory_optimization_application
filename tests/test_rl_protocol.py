@@ -1,5 +1,6 @@
 """
-RL protocol on real forecasts (read-only), with MLflow and run folders in a temp dir:
+RL protocol on real forecasts (read-only), with MLflow (conftest's isolated store) and run
+folders in a temp dir:
 training loads only rl_train and rl_val, seeds group into one configuration, the
 champion is scored once on rl_test, and a second test score needs an override.
 """
@@ -14,28 +15,27 @@ import pytest
 
 from src.rl import evaluate as rl_eval
 from src.rl import train as rl_train
-from src.rl.selection import champion, leaderboard
 from src.rl.agents import model_file
+from src.rl.selection import champion, leaderboard
 from src.rl.spec import build_spec, default_state
-from src.utils.config import get_project_root, load_config
-
-ROOT = get_project_root()
+from src.utils.config import load_config
 
 
-@pytest.mark.skipif(
-    not (ROOT / "artifacts" / "forecasts" / "forecast_setup.json").exists(),
-    reason="needs a forecasting run on disk",
-)
+@pytest.mark.slow
+@pytest.mark.needs_local_run
 @pytest.mark.parametrize(
     ("agent", "training_forecasts"),
     [("ppo", "unbiased_by_class"), ("grpo", "as_is")],
 )
-def test_train_validate_select_and_lock_test(tmp_path: Path, monkeypatch, agent: str, training_forecasts: str):
+def test_train_validate_select_and_lock_test(
+    tmp_path: Path, monkeypatch, local_forecast_run: str, agent: str, training_forecasts: str
+):
     config = load_config()
-    db = f"sqlite:///{tmp_path / 'mlruns.db'}"
-    config["rl"]["mlflow"]["tracking_uri"] = db
-    config["rl"]["artifacts"] = {"runs_dir": str(tmp_path / "runs")}
-    mlflow.set_tracking_uri(db)
+    # RL run folders go to a temp cache; the real forecasting run is linked in read-only.
+    real_cache = Path(config["_project_root"]) / config["mlflow"]["cache_dir"]
+    config["mlflow"]["cache_dir"] = str(tmp_path / "cache")
+    (tmp_path / "cache").mkdir()
+    (tmp_path / "cache" / local_forecast_run).symlink_to(real_cache / local_forecast_run)
 
     blocks: list[str] = []
     real_block = rl_train.block_episodes
@@ -48,7 +48,7 @@ def test_train_validate_select_and_lock_test(tmp_path: Path, monkeypatch, agent:
     monkeypatch.setattr(rl_train, "block_episodes", few_episodes)
     monkeypatch.setattr(rl_eval, "block_episodes", few_episodes)
 
-    data = rl_train.load_run_data(config, None)
+    data = rl_train.load_run_data(config, local_forecast_run)
     spec = build_spec(
         config, str(data.run_id), "residual", agent,
         default_state("residual", data.measure_ids), data.default_anchor,

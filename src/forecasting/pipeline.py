@@ -4,16 +4,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import tempfile
 from pathlib import Path
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import mlflow
 import numpy as np
 import pandas as pd
-from mlflow.exceptions import MlflowException
-from mlflow.tracking import MlflowClient
 
 from src.forecasting.calibration import fit_quantile_shifts
 from src.forecasting.entity_metrics import log_cv_entity_metrics
@@ -37,10 +37,8 @@ from src.forecasting.model import build_feature_matrix, get_feature_columns
 from src.forecasting.periods import (
     build_setup_record,
     current_setup_hash,
-    load_setup,
     resolve_periods,
     save_setup,
-    setup_path,
 )
 from src.forecasting.preprocessing import load_panel_from_config
 from src.forecasting.validation import TimeSeriesFold, get_unique_dates, iter_fold_masks, make_folds
@@ -140,13 +138,13 @@ def _log_feature_importances(forecaster, measure: Measure, top_n: int = 30) -> N
         .head(top_n)
         .reset_index(drop=True)
     )
-    tracking.log_dataframe(imp_df, artifact_path="feature_importance")
+    tracking.log_dataframe(imp_df, "feature_importance", "feature_importance.csv")
 
     fig, ax = plt.subplots(figsize=(8, max(4, top_n // 3)))
     ax.barh(imp_df["feature"][::-1], imp_df["importance"][::-1])
     ax.set_xlabel("Gain (importance)")
     ax.set_title(f"Top feature importances — {label}")
-    tracking.log_figure(fig, artifact_path="feature_importance")
+    tracking.log_figure(fig, "feature_importance", "feature_importance.png")
 
 
 def _log_cv_chart(fold_metrics: list[dict], metric: str) -> None:
@@ -160,7 +158,7 @@ def _log_cv_chart(fold_metrics: list[dict], metric: str) -> None:
     ax.set_xlabel("Fold")
     ax.set_ylabel(metric)
     ax.set_title(f"CV {metric} per fold")
-    tracking.log_figure(fig, artifact_path="cv_charts")
+    tracking.log_figure(fig, "cv_charts", f"cv_{metric}_per_fold.png")
 
 
 def _log_oof_sample_chart(oof: pd.DataFrame, measures: list[Measure]) -> None:
@@ -178,7 +176,7 @@ def _log_oof_sample_chart(oof: pd.DataFrame, measures: list[Measure]) -> None:
     ax.set_xlabel("Date")
     ax.set_ylabel("Units")
     ax.legend()
-    tracking.log_figure(fig, artifact_path="cv_charts")
+    tracking.log_figure(fig, "cv_charts", "oof_sample.png")
 
 
 def _choose_model(
@@ -287,25 +285,9 @@ def _fit_rl_block_forecasts(
     return combined, block_metrics, last_forecaster
 
 
-def _keep_previous_forecasts(config: dict) -> None:
-    """Attach the on-disk forecasts to the run that wrote them if that run never logged them."""
-    prev_id = (load_setup(config) or {}).get("run_id")
-    path = setup_path(config).with_name("train_forecasts.parquet")
-    if not prev_id or not path.exists():
-        return
-    client = MlflowClient()
-    try:
-        logged = {a.path for a in client.list_artifacts(prev_id, "forecasts")}
-        if "forecasts/train_forecasts.parquet" not in logged:
-            client.log_artifact(prev_id, str(path), artifact_path="forecasts")
-    except MlflowException:  # run is in another tracking store
-        pass
-
-
 def run_pipeline(config_path: str | None = None, force: bool = False) -> dict:
     """Full pipeline: load → features → model choice → CV → RL-block forecasts → artifacts."""
     config = load_config(config_path)
-    root = Path(config["_project_root"])
 
     measures = parse_measures(config)
     primary = primary_measure(config, measures)
@@ -314,10 +296,9 @@ def run_pipeline(config_path: str | None = None, force: bool = False) -> dict:
         raise ValueError("; ".join(errors))
     metric = primary_metric_name(primary)
 
-    mlflow_cfg = config["forecasting"]["mlflow"]
     experiment_name = tracking.setup_mlflow(config, "forecasting")
     config_hash = current_setup_hash(config)
-    if mlflow_cfg.get("skip_duplicate_runs", True):
+    if config["forecasting"].get("skip_duplicate_runs", True):
         tracking.check_duplicate_run(experiment_name, config_hash, force=force)
 
     periods = resolve_periods(config)
@@ -331,8 +312,9 @@ def run_pipeline(config_path: str | None = None, force: bool = False) -> dict:
     model_cfg = config["forecasting"]["model"]
     calibrate = bool(config["forecasting"].get("calibrate_quantiles", False))
 
-    with mlflow.start_run(run_name="demand_forecast_pipeline"):
+    with mlflow.start_run(run_name="demand_forecast_pipeline") as run:
         mlflow.set_tag("config_hash", config_hash)
+        tracking.log_provenance(config)
         mlflow.log_params({
             "measures": ",".join(m.id for m in measures),
             "primary_measure": primary.id,
@@ -382,7 +364,7 @@ def run_pipeline(config_path: str | None = None, force: bool = False) -> dict:
         _log_cv_chart(fold_metrics, metric)
         _log_oof_sample_chart(oof, measures)
         if fold_metrics:
-            tracking.log_dataframe(pd.DataFrame(fold_metrics), artifact_path="cv_detail")
+            tracking.log_dataframe(pd.DataFrame(fold_metrics), "cv_detail", "fold_metrics.csv")
         if not oof.empty:
             log_cv_entity_metrics(oof, measures, primary)
 
@@ -400,44 +382,36 @@ def run_pipeline(config_path: str | None = None, force: bool = False) -> dict:
         )
         for k, v in block_metrics.items():
             mlflow.log_metric(k, v)
-        for w in periods.warnings:
-            mlflow.set_tag(f"warning_{len(w)}", w[:250])
+        if periods.warnings:
+            mlflow.log_dict({"warnings": list(periods.warnings)}, "warnings.json")
         if forecaster is not None:
             _log_feature_importances(forecaster, primary)
 
         # --- Save artifacts ---
-        model_dir = root / config["forecasting"]["artifacts"]["model_dir"]
-        model_dir.mkdir(parents=True, exist_ok=True)
-        model_path = model_dir / "forecaster.joblib"
+        # Files go to the run's artifact cache and are logged from there, so RL and the app read
+        # this run without downloading. The fitted model is logged only (nothing reads it locally).
         if forecaster is not None:
-            forecaster.save(model_path)
-            mlflow.log_artifact(str(model_path))
+            with tempfile.TemporaryDirectory() as tmp:
+                model_path = Path(tmp) / "forecaster.joblib"
+                forecaster.save(model_path)
+                mlflow.log_artifact(str(model_path))
 
-        forecasts_dir = root / config["forecasting"]["artifacts"]["forecasts_dir"]
+        forecasts_dir = tracking.run_cache_dir(config, run.info.run_id) / "forecasts"
         forecasts_dir.mkdir(parents=True, exist_ok=True)
         forecast_cols = ["store", "product", "date", "sales"] + [m.id for m in measures]
         if not full_scored.empty:
-            _keep_previous_forecasts(config)
-            fc_path = forecasts_dir / "train_forecasts.parquet"
             # ``fit_end`` records which fit wrote each row, so forecast age can be audited.
-            full_scored[forecast_cols + ["fit_end"]].to_parquet(fc_path, index=False)
-            mlflow.log_artifact(str(fc_path), artifact_path="forecasts")
-        run = mlflow.active_run()
+            full_scored[forecast_cols + ["fit_end"]].to_parquet(forecasts_dir / "train_forecasts.parquet", index=False)
         record = build_setup_record(
-            config,
-            periods,
-            run_id=run.info.run_id if run is not None else None,
-            extra=manifest_record(measures, primary, calibration),
+            config, periods, run_id=run.info.run_id, extra=manifest_record(measures, primary, calibration)
         )
-        path = save_setup(config, record)
-        mlflow.log_artifact(str(path), artifact_path="forecasts")
+        save_setup(forecasts_dir / "forecast_setup.json", record)
         if not oof.empty:
-            oof_path = forecasts_dir / "oof_forecasts.parquet"
-            oof[forecast_cols + ["fold_id"]].to_parquet(oof_path, index=False)
-            mlflow.log_artifact(str(oof_path), artifact_path="forecasts")
+            oof[forecast_cols + ["fold_id"]].to_parquet(forecasts_dir / "oof_forecasts.parquet", index=False)
+        mlflow.log_artifacts(str(forecasts_dir), artifact_path="forecasts")
 
         mlflow.log_dict(cv_metrics, "cv_metrics.json")
-        return {"cv_metrics": cv_metrics, "model_path": str(model_path)}
+        return {"cv_metrics": cv_metrics, "run_id": run.info.run_id}
 
 
 def main() -> None:

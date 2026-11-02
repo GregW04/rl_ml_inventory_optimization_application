@@ -1,5 +1,16 @@
 # RL-ML Inventory Optimization — central configuration
 
+mlflow:
+  # Shared store for every stage. MLFLOW_TRACKING_URI overrides it: `make mlflow-server` / `make app`
+  # run the local tracking server (http://127.0.0.1:5050) on top of this same SQLite file.
+  tracking_uri: sqlite:///mlruns.db
+  experiments:
+    forecasting: vn2-demand-forecasting
+    rl: vn2-inventory-rl
+  # Read-through cache of run artifacts, one folder per run id. A finished run's artifacts never
+  # change, so cached files are never stale; delete a folder to free space.
+  cache_dir: artifacts/cache
+
 project:
   name: rl-ml-inventory-optimization
   seed: 42
@@ -138,14 +149,8 @@ forecasting:
     n_trials_no_improve: 10
     early_stopping_min_delta: 0.0001
 
-  mlflow:
-    experiment_name: vn2-demand-forecasting
-    tracking_uri: sqlite:///mlruns.db
-    skip_duplicate_runs: true
-
-  artifacts:
-    model_dir: artifacts/models
-    forecasts_dir: artifacts/forecasts
+  # Refuse to start when a FINISHED run with the same config hash exists (CLI; --force skips).
+  skip_duplicate_runs: true
 
 periods:
   data_start: null
@@ -222,10 +227,3 @@ rl:
       early_stop_patience: 400
       early_stop_min_delta: 0.2
       early_stop_every: 100
-
-  mlflow:
-    experiment_name: vn2-inventory-rl
-    tracking_uri: sqlite:///mlruns.db
-
-  artifacts:
-    runs_dir: artifacts/rl/runs

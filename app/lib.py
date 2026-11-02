@@ -52,10 +52,9 @@ from src.forecasting.periods import (  # noqa: E402
     panel_weeks,
     resolve_periods,
 )
+from src.simulation.vn2 import check_vn2_compliance  # noqa: E402
 from src.utils import tracking  # noqa: E402
 from src.utils.config import load_config  # noqa: E402
-from src.simulation.vn2 import check_vn2_compliance  # noqa: E402
-
 
 # ---------------------------------------------------------------------------
 # Config + tracking
@@ -69,15 +68,14 @@ def get_config() -> dict:
 
 def init_tracking() -> str:
     """Point MLflow at the canonical (absolute) tracking store; return the URI."""
-    return tracking.init_tracking(get_config(), "forecasting")
+    return tracking.init_tracking(get_config())
 
 
 def experiment_names() -> dict[str, str]:
     """Map section → experiment name from config."""
     cfg = get_config()
     return {
-        "forecasting": cfg["forecasting"]["mlflow"]["experiment_name"],
-        "rl": cfg["rl"]["mlflow"]["experiment_name"],
+        stage: tracking.experiment_name(cfg, stage) for stage in ("forecasting", "rl")
     }
 
 
@@ -252,13 +250,25 @@ def test_scores(forecast_run_id: str) -> pd.DataFrame:
     return scored_test_runs(get_config(), forecast_run_id)
 
 
+@st.cache_data(ttl=15, show_spinner=False)
+def scored_forecast_runs() -> set[str]:
+    """Forecasting runs whose test block has been scored (a FINISHED ``stage=test`` RL run)."""
+    init_tracking()
+    runs = tracking.search_runs(
+        tracking.experiment_name(get_config(), "rl"),
+        filter_string="tags.stage = 'test' and attributes.status = 'FINISHED'",
+    )
+    if runs.empty or "tags.forecast_run_id" not in runs:
+        return set()
+    return set(runs["tags.forecast_run_id"].dropna())
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def legacy_test_count(forecast_run_id: str) -> int:
     """How often the test block was evaluated before the lock existed."""
-    from src.rl.evaluate import legacy_test_runs
+    from src.rl.evaluate import legacy_test_evaluations
 
-    init_tracking()
-    return len(legacy_test_runs(get_config(), forecast_run_id))
+    return legacy_test_evaluations(get_config(), forecast_run_id)
 
 
 def rl_train_runs(forecast_run_id: str | None = None) -> pd.DataFrame:

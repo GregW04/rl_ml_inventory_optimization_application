@@ -21,7 +21,7 @@ from src.rl.spec import (
 from src.simulation.anchor import AnchorSpec
 from src.simulation.vn2 import VN2Rules
 from src.simulation.vn2_env import VN2Env
-from src.utils.config import get_project_root, load_config
+from src.utils.config import load_config
 
 RULES = VN2Rules()
 MEASURES = ["mean_h0", "mean_h1", "q50_h2", "q83_h2"]
@@ -145,16 +145,13 @@ def test_poisson_target_anchor():
     assert shadow == pytest.approx(per_ep["cost_eur"].to_numpy(), abs=1e-9)
 
 
-@pytest.mark.skipif(
-    not (get_project_root() / "artifacts" / "forecasts" / "forecast_setup.json").exists(),
-    reason="needs a forecasting run on disk",
-)
-def test_real_validation_windows_match():
+@pytest.mark.needs_local_run
+def test_real_validation_windows_match(local_forecast_run):
     from src.rl.spec import default_state
     from src.rl.train import block_episodes, load_run_data
 
     config = load_config()
-    data = load_run_data(config, None)
+    data = load_run_data(config, local_forecast_run)
     eps = block_episodes(config, data, "rl_val")
     eps = {k: eps[k] for k in list(eps)[:300]}
     spec = PolicySpec(str(data.run_id), "residual", "ppo",

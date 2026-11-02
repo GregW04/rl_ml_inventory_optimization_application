@@ -2,20 +2,15 @@
 
 from __future__ import annotations
 
-import argparse
-import tempfile
-from pathlib import Path
 from typing import Any
 
 import mlflow
 import numpy as np
 import pandas as pd
-from mlflow.tracking import MlflowClient
 
 from src.forecasting.forecaster import evaluate_measures
-from src.forecasting.measures import HORIZONS, Measure, primary_measure, primary_metric_name, run_measures
+from src.forecasting.measures import HORIZONS, Measure, primary_metric_name
 from src.utils import tracking
-from src.utils.config import load_config
 
 
 def ensure_oof_targets(oof: pd.DataFrame) -> pd.DataFrame:
@@ -93,50 +88,7 @@ def log_cv_entity_metrics(oof: pd.DataFrame, measures: list[Measure], primary: M
     """Compute entity metrics and log table + per-series tail scalars to the active MLflow run."""
     entity_df = compute_cv_entity_metrics(oof, measures)
     if not entity_df.empty:
-        tracking.log_dataframe(entity_df, artifact_path="cv_by_entity")
+        tracking.log_dataframe(entity_df, "cv_by_entity", "cv_by_entity.csv")
         for key, val in per_series_cv_scalars(oof, primary).items():
             mlflow.log_metric(key, val)
     return entity_df
-
-
-def attach_cv_entity_metrics_to_run(
-    run_id: str,
-    oof_path: str | Path,
-    measures: list[Measure],
-    *,
-    artifact_subdir: str = "cv_by_entity",
-) -> pd.DataFrame:
-    """Backfill entity metrics onto a FINISHED run (artifacts only)."""
-    oof = ensure_oof_targets(pd.read_parquet(oof_path))
-    entity_df = compute_cv_entity_metrics(oof, measures)
-    if entity_df.empty:
-        return entity_df
-
-    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as f:
-        tmp = f.name
-    entity_df.to_csv(tmp, index=False)
-    MlflowClient().log_artifact(run_id, tmp, artifact_path=artifact_subdir)
-    Path(tmp).unlink(missing_ok=True)
-    return entity_df
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Backfill CV entity metrics to an MLflow run")
-    parser.add_argument("--config", default="configs/config.yaml")
-    parser.add_argument("--run-id", required=True)
-    parser.add_argument(
-        "--oof",
-        default="artifacts/forecasts/oof_forecasts.parquet",
-        help="Out-of-fold predictions parquet",
-    )
-    args = parser.parse_args()
-
-    config = load_config(args.config)
-    tracking.init_tracking(config, "forecasting")
-    measures = run_measures(config, args.run_id) or [primary_measure(config)]
-    entity_df = attach_cv_entity_metrics_to_run(args.run_id, args.oof, measures)
-    print(f"Logged {len(entity_df)} rows to run {args.run_id}")
-
-
-if __name__ == "__main__":
-    main()

@@ -16,9 +16,9 @@ from __future__ import annotations
 import argparse
 import json
 from dataclasses import dataclass, replace
-from pathlib import Path
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import mlflow
@@ -34,10 +34,8 @@ from src.rl.spec import PolicySpec, validate_spec
 from src.rl.vn2_data import _PANEL_COLS, build_forecast_lookup, build_vn2_episodes, compute_demand_scales
 from src.simulation.anchor import AnchorSpec, resolve_anchor
 from src.simulation.vn2 import VN2Rules
-from src.simulation.vn2_env import VN2Env
 from src.utils import tracking
 from src.utils.config import load_config
-
 
 # ---------------------------------------------------------------------------
 # Forecasting-run data
@@ -124,12 +122,6 @@ def block_episodes(config: dict, data: RunData, block: str) -> dict:
     )
 
 
-def runs_dir(config: dict) -> Path:
-    """Local folder holding one sub-folder of artifacts per RL run."""
-    rel = config["rl"].get("artifacts", {}).get("runs_dir", "artifacts/rl/runs")
-    return Path(config["_project_root"]) / rel
-
-
 # ---------------------------------------------------------------------------
 # In-sample learning curve (display only: weights are never picked from it)
 # ---------------------------------------------------------------------------
@@ -160,7 +152,7 @@ def log_curve_chart(points: list[tuple[int, float]], title: str) -> None:
     ax.set_xlabel("Training windows replayed")
     ax.set_ylabel("Cost vs anchor on 2,000 training windows (%)")
     ax.set_title(f"{title} — in-sample curve (below 0 beats the anchor)")
-    tracking.log_figure(fig, artifact_path="rl_charts")
+    tracking.log_figure(fig, "rl_charts", "insample_curve.png")
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +270,7 @@ def train_agent(
             "agent": spec.agent,
             "role": "deploy" if spec.seed == project_seed else "seed_check",
         })
+        tracking.log_provenance(config)
         params = {
             "method": spec.method,
             "agent": spec.agent,
@@ -302,7 +295,8 @@ def train_agent(
             params["order_cap_mult"] = spec.order_cap_mult
         mlflow.log_params(params)
 
-        run_dir = runs_dir(config) / run.info.run_id
+        # Written straight into the run's artifact cache, then logged as ``policy/``.
+        run_dir = tracking.run_cache_dir(config, run.info.run_id) / "policy"
         run_dir.mkdir(parents=True, exist_ok=True)
         if bias_factors is not None:
             bias_factors.to_csv(run_dir / "training_bias_factors.csv", index=False)

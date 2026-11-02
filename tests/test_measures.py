@@ -62,15 +62,15 @@ def test_duplicate_labels_and_bad_primary():
 
 def test_run_measures_skips_retired_kinds(tmp_path):
     # Older manifests can still list a kind that is no longer forecast.
-    setup = tmp_path / "fc" / "forecast_setup.json"
-    setup.parent.mkdir()
+    setup = tmp_path / "cache" / "run1" / "forecasts" / "forecast_setup.json"
+    setup.parent.mkdir(parents=True)
     setup.write_text(json.dumps({"measures": [
         Measure("mean", 0).to_dict(),
         {"kind": "std", "horizon": 0, "tau": None},
         Measure("quantile", 2, 0.8333).to_dict(),
     ]}))
-    cfg = {"_project_root": str(tmp_path), "forecasting": {"artifacts": {"forecasts_dir": "fc"}}, "vn2": {}}
-    assert [m.id for m in run_measures(cfg, None)] == ["mean_h0", "q83_h2"]
+    cfg = {"_project_root": str(tmp_path), "mlflow": {"cache_dir": "cache"}, "vn2": {}}
+    assert [m.id for m in run_measures(cfg, "run1")] == ["mean_h0", "q83_h2"]
 
 
 def test_default_primary_and_metric():

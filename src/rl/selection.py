@@ -28,9 +28,9 @@ ANCHOR = "anchor"
 
 def train_runs(config: dict, forecast_run_id: str) -> pd.DataFrame:
     """Finished training runs (``stage=train``) on a forecasting run."""
-    tracking.init_tracking(config, "rl")
+    tracking.init_tracking(config)
     runs = tracking.search_runs(
-        config["rl"]["mlflow"]["experiment_name"],
+        tracking.experiment_name(config, "rl"),
         max_results=1000,
         filter_string=(
             f"tags.stage = 'train' and tags.forecast_run_id = '{forecast_run_id}' "
@@ -43,14 +43,11 @@ def train_runs(config: dict, forecast_run_id: str) -> pd.DataFrame:
 
 
 def policy_dir(config: dict, rl_run_id: str) -> Path:
-    """Local folder with a run's ``model.zip``, ``spec.json`` and validation episodes."""
-    from src.rl.train import runs_dir
-
-    local = runs_dir(config) / rl_run_id
-    if (local / "spec.json").exists():
-        return local
-    tracking.init_tracking(config, "rl")
-    return Path(tracking.download_artifact(rl_run_id, "policy", dst_path=str(local / "_download")))
+    """Local copy of a run's ``policy/`` artifact: weights, ``spec.json`` and its episodes."""
+    path = tracking.cached_artifact(config, rl_run_id, "policy")
+    if path is None or not (path / "spec.json").exists():
+        raise FileNotFoundError(f"RL run {rl_run_id} has no policy/ artifact with a spec.json.")
+    return path
 
 
 def load_policy(config: dict, rl_run_id: str):

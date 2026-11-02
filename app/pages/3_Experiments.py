@@ -33,6 +33,13 @@ if runs.empty:
     st.info("No runs for this experiment yet.")
     st.stop()
 
+# Test-block scores stay hidden until that forecasting run's test block has been scored (as on
+# the Forecasts page): seeing them earlier would turn the test block into a second validation set.
+test_cols = [c for c in runs.columns if c.startswith("metrics.oos_rl_test_")]
+if test_cols:
+    runs.loc[~runs["run_id"].isin(lib.scored_forecast_runs()), test_cols] = float("nan")
+    st.caption("Test-block scores (`oos_rl_test_*`) appear once a forecasting run's test block has been scored.")
+
 # Short, readable overview table
 meta_cols = [c for c in ["run_id", "tags.mlflow.runName", "status", "start_time"] if c in runs.columns]
 metric_cols = sorted(c for c in runs.columns if c.startswith("metrics."))

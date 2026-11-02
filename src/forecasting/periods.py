@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,8 +9,6 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-
-from mlflow.exceptions import MlflowException
 
 from src.forecasting.validation import TimeSeriesFold, generate_expanding_folds
 from src.utils import tracking
@@ -494,12 +491,6 @@ def timeline(periods: Periods) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def setup_path(config: dict) -> Path:
-    root = Path(config.get("_project_root", get_project_root()))
-    rel = config["forecasting"]["artifacts"]["forecasts_dir"]
-    return root / rel / "forecast_setup.json"
-
-
 def periods_to_dict(periods: Periods) -> dict[str, Any]:
     return {
         "data_start": str(periods.data_start.date()),
@@ -547,46 +538,40 @@ def build_setup_record(
     }
 
 
-def save_setup(config: dict, record: dict) -> Path:
-    path = setup_path(config)
+def save_setup(path: Path, record: dict) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(record, f, indent=2, default=str)
     return path
 
 
-def load_setup(config: dict) -> dict | None:
-    path = setup_path(config)
-    if not path.exists():
+def latest_forecast_run_id(config: dict) -> str | None:
+    """Newest FINISHED forecasting run that wrote RL forecasts (it logs the RL block dates)."""
+    tracking.init_tracking(config)
+    runs = tracking.search_runs(
+        tracking.experiment_name(config, "forecasting"),
+        max_results=50,
+        filter_string="attributes.status = 'FINISHED'",
+    )
+    if runs.empty or "params.rl_train_start" not in runs.columns:
         return None
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+    runs = runs[runs["params.rl_train_start"].notna()]
+    return None if runs.empty else str(runs.iloc[0]["run_id"])
 
 
 def fetch_run_file(config: dict, run_id: str | None, name: str) -> Path | None:
-    """Local copy of ``forecasts/<name>`` for a forecasting run, or None if it has none.
-
-    ``run_id=None`` means the latest run on disk. Other runs are downloaded from
-    MLflow once into ``<forecasts_dir>/runs/<run_id>/``.
     """
-    latest = setup_path(config).with_name(name)
-    if run_id is None or (load_setup(config) or {}).get("run_id") == run_id:
-        return latest if latest.exists() else None
-    cache_dir = setup_path(config).parent / "runs" / run_id
-    cached = cache_dir / name
-    if not cached.exists():
-        tracking.init_tracking(config, "forecasting")
-        try:
-            tracking.download_artifact(run_id, f"forecasts/{name}", dst_path=str(cache_dir))
-        except MlflowException:
-            with contextlib.suppress(OSError):
-                cache_dir.rmdir()
-            return None
-    return cached if cached.exists() else None
+    Local copy of ``forecasts/<name>`` of a forecasting run (None if the run has none), from
+    the run's artifact cache. ``run_id=None`` means the newest finished forecasting run.
+    """
+    run_id = run_id or latest_forecast_run_id(config)
+    if run_id is None:
+        return None
+    return tracking.cached_artifact(config, run_id, f"forecasts/{name}")
 
 
 def load_run_setup(config: dict, run_id: str | None) -> dict | None:
-    """Setup record of a forecasting run (None → latest on disk)."""
+    """Setup record of a forecasting run (None → the newest finished one)."""
     path = fetch_run_file(config, run_id, "forecast_setup.json")
     if path is None:
         return None
@@ -600,7 +585,8 @@ def current_setup_hash(config: dict) -> str:
         "forecasting": {
             k: v
             for k, v in config.get("forecasting", {}).items()
-            if k not in ("mlflow", "artifacts")
+            # Not part of the setup; excluded so hashes match runs made before they moved.
+            if k not in ("mlflow", "artifacts", "skip_duplicate_runs")
         },
         "data": {
             k: config.get("data", {}).get(k)
