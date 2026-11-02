@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.0  # exact tag: setup-uv has no moving major tags
       - run: uvx ruff@0.17.1 check src app tests
 
   test:
@@ -23,7 +23,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.0  # exact tag: setup-uv has no moving major tags
         with:
           python-version: "3.12"
       - name: Install from the lock file (CPU torch on Linux)
