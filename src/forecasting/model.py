@@ -229,7 +229,11 @@ class _BaseForecaster:
 
     @classmethod
     def load(cls, path: str | Path) -> _BaseForecaster:
-        payload = joblib.load(path)
+        return cls.from_payload(joblib.load(path))
+
+    @classmethod
+    def from_payload(cls, payload: dict) -> _BaseForecaster:
+        """Rebuild a fitted forecaster from :meth:`_payload` (what :meth:`save` writes)."""
         forecaster = cls(
             payload["config"],
             model_name=payload.get("model_name", "lightgbm"),

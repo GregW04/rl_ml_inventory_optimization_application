@@ -58,6 +58,58 @@ Every forecasting, RL training and test run (`tracking.log_provenance`) records:
 - **Artifact** `config/effective.yaml`: the config the run actually used, including the app's overrides.
 - **For a dirty tree**: `provenance/git_status.txt` and `provenance/git_diff.patch`.
 
+## Model Registry and serving
+
+The production loop (in progress, see the MLOps plan) keeps two registered models per environment
+(`src/ops/registry.py`), `<env>-vn2-forecaster` and `<env>-vn2-policy`, with `env` = `live` or `sim-<name>`.
+Three aliases have fixed meanings:
+
+- `champion` serves. Consumers resolve `models:/<name>@champion` at runtime, so moving the alias *is* the
+  deployment.
+- `challenger` is under validation.
+- `previous` is the champion before the last promotion. `promote` sets it before moving `champion`, and
+  `rollback` restores it.
+
+Model version tags hold the audit trail (trigger, recipe key, data digest, validation status).
+
+**The forecaster as an MLflow model** (`src/serving/forecaster.py`, `log_forecaster`):
+
+- **Logged from code.** `python_model=src/serving/forecaster_model.py`, with the project's `src/` as
+  `code_paths`. Nothing is unpickled at load time except the fitted boosters.
+- **Artifacts:**
+  - `forecaster.joblib` (single backend or ensemble, read by `forecaster.load_forecaster`);
+  - `master.csv` (the hierarchy);
+  - `meta.json` (the recipe, its key, the as-of week, the data digest and the serving config).
+- **Environment:** pip requirements pinned to the serving packages only, with no torch. MLflow also copies
+  `uv.lock` and `pyproject.toml` into the model.
+- **Contract:** the input is the weekly history (`store`, `product`, `date`, `sales`, `in_stock`) up to the
+  as-of week, and the param `as_of` defaults to the latest week in the input. The output is one row per SKU for
+  the decision week `as_of + 1 week`, one column per measure. The LoggedModel's params are `recipe_key`,
+  `model_name`, `as_of` and `data_digest`.
+
+```python
+model = mlflow.pyfunc.load_model("models:/live-vn2-forecaster@champion")  # in a torch-free process
+forecasts = model.predict(history, params={"as_of": "2024-04-01"})
+```
+
+**Recipe and refit** (`src/forecasting/recipe.py`):
+
+- A recipe covers features, measures, the backend or ensemble, its hyperparameters, the objective and the
+  transform. Its `key()` is the same for every refit of that recipe; refits differ by `panel_digest`.
+- A refit at `as_of` trains on rows up to `as_of − 2` weeks, so their h2 label is known. That is the same
+  cut the research block fits use.
+- The inference frame appends the decision week to the panel.
+- `tests/test_feature_pit.py` and `tests/test_recipe.py` check that a week's features never depend on where
+  the panel ends, so training and serving rows are identical.
+
+**Two fixes from 2026-11-02 that affect the research pipeline:**
+
+- **Holiday distances** now come from the event calendar instead of the weeks present in the panel. Before
+  the fix, a panel ending shortly before an event served "no event in sight" (Easter 2023: 4 instead of 2).
+  On the full research panel nothing changes (0 of 98,835 rows).
+- **LightGBM bagging is now active.** `subsample` was set without `subsample_freq`, so it never sampled rows.
+  LightGBM results of forecasting runs made after the fix differ from earlier ones.
+
 ## What each run logs
 
 ### `vn2-demand-forecasting` (one run per pipeline execution)

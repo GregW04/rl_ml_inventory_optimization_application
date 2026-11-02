@@ -29,6 +29,8 @@ configs/config.yaml      # single source of truth
 src/forecasting/         # preprocessing, features, validation, model, pipeline
 src/simulation/          # VN2 replay engine, lost-sales anchor, RL environment
 src/rl/                  # policy spec, batched replay, PPO / GRPO training, selection, test scoring
+src/serving/             # forecaster (and later the policy) as MLflow pyfunc models
+src/ops/                 # production loop: Model Registry conventions (more in progress)
 src/utils/               # metrics, config, and tracking.py (MLflow setup, provenance, artifact cache)
 app/                     # Streamlit frontend (Home + 5 pages)
 notebooks/               # EDA and pipeline demos

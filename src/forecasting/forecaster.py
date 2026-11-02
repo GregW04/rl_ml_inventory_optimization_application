@@ -253,6 +253,24 @@ class EnsembleForecaster:
             path,
         )
 
+    @classmethod
+    def from_payload(cls, payload: dict) -> EnsembleForecaster:
+        """Rebuild a fitted ensemble from what :meth:`save` writes."""
+        members = {name: MeasureForecaster.from_payload(p) for name, p in payload["members"].items()}
+        first = next(iter(members.values()))
+        ens = cls(first.config, list(members), measures=[Measure.from_dict(m) for m in payload["measures"]])
+        ens.members = members
+        ens.calibration = dict(payload.get("calibration", {}))
+        return ens
+
+
+def load_forecaster(path: str | Path) -> MeasureForecaster | EnsembleForecaster:
+    """A forecaster saved by ``save`` (single backend or ensemble), ready to predict."""
+    payload = joblib.load(path)
+    if payload.get("kind") == ENSEMBLE:
+        return EnsembleForecaster.from_payload(payload)
+    return MeasureForecaster.from_payload(payload)
+
 
 def ensemble_settings(config: dict) -> tuple[bool, list[str]]:
     """(enabled, members) from ``forecasting.ensemble``."""
