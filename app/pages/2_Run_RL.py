@@ -29,7 +29,6 @@ from src.rl.spec import (
     TRAINING_FORECASTS,
     build_spec,
     default_state,
-    is_torch_agent,
     validate_spec,
     windows_per_iteration,
 )
@@ -158,42 +157,32 @@ method = o1.radio(
 agent = o2.selectbox(
     "Agent", list(AGENTS), format_func=lambda a: AGENT_LABELS[a], key="rl_agent",
     help="PPO and GRPO train on a batched replay of the training windows and start at the "
-    "anchor (residual). DQN is the Stable-Baselines3 baseline.",
+    "anchor (residual).",
 )
 agent_cfg = base_cfg["rl"]["agents"][agent]
-if is_torch_agent(agent):
-    iterations = o3.number_input(
-        "Iterations", min_value=1, max_value=20_000, value=int(agent_cfg.get("iterations", 300)),
-        step=10, key=f"rl_iters_{agent}",
-        help="Each iteration replays a batch of training windows and updates the policy.",
-    )
-    early_stop = {"early_stop": o3.checkbox(
-        "Stop early on the training sample", value=bool(agent_cfg.get("early_stop", False)), key=f"rl_early_{agent}",
-        help="Iterations become the budget. Training stops once the cost on the fixed training windows behind the "
-        "learning curve hasn't improved by the minimum for the patience, and keeps the weights at the stop. "
-        "Validation is never used.",
-    )}
-    if early_stop["early_stop"]:
-        early_stop["early_stop_patience"] = int(o3.number_input(
-            "Patience (iterations)", min_value=1, max_value=20_000,
-            value=int(agent_cfg.get("early_stop_patience", 400)), step=50, key=f"rl_es_patience_{agent}",
-            help=f"Checked every {int(agent_cfg.get('early_stop_every', 100))} iterations.",
-        ))
-        early_stop["early_stop_min_delta"] = float(o3.number_input(
-            "Minimum improvement (pts)", min_value=0.0, max_value=10.0,
-            value=float(agent_cfg.get("early_stop_min_delta", 0.2)), step=0.05, key=f"rl_es_delta_{agent}",
-            help="An evaluation counts as an improvement only if the training-sample cost vs anchor beats the best "
-            "so far by at least this many percentage points.",
-        ))
-    timesteps = None
-else:
-    default_steps = int(agent_cfg.get("total_timesteps", 100_000))
-    timesteps = o3.number_input(
-        "Timesteps", min_value=1_000, max_value=20_000_000, value=min(default_steps, 50_000),
-        step=1_000, key=f"rl_steps_{agent}",
-    )
-    iterations = None
-    early_stop = None
+iterations = o3.number_input(
+    "Iterations", min_value=1, max_value=20_000, value=int(agent_cfg.get("iterations", 300)),
+    step=10, key=f"rl_iters_{agent}",
+    help="Each iteration replays a batch of training windows and updates the policy.",
+)
+early_stop = {"early_stop": o3.checkbox(
+    "Stop early on the training sample", value=bool(agent_cfg.get("early_stop", False)), key=f"rl_early_{agent}",
+    help="Iterations become the budget. Training stops once the cost on the fixed training windows behind the "
+    "learning curve hasn't improved by the minimum for the patience, and keeps the weights at the stop. "
+    "Validation is never used.",
+)}
+if early_stop["early_stop"]:
+    early_stop["early_stop_patience"] = int(o3.number_input(
+        "Patience (iterations)", min_value=1, max_value=20_000,
+        value=int(agent_cfg.get("early_stop_patience", 400)), step=50, key=f"rl_es_patience_{agent}",
+        help=f"Checked every {int(agent_cfg.get('early_stop_every', 100))} iterations.",
+    ))
+    early_stop["early_stop_min_delta"] = float(o3.number_input(
+        "Minimum improvement (pts)", min_value=0.0, max_value=10.0,
+        value=float(agent_cfg.get("early_stop_min_delta", 0.2)), step=0.05, key=f"rl_es_delta_{agent}",
+        help="An evaluation counts as an improvement only if the training-sample cost vs anchor beats the best "
+        "so far by at least this many percentage points.",
+    ))
 
 p1, p2 = st.columns(2)
 if method == "residual":
@@ -275,16 +264,14 @@ state = [*INVENTORY_FEATURES, *[i for i in measure_ids if i in fc_state], *an_st
 
 spec = build_spec(
     base_cfg, run_id, method, agent, state, anchor,
-    total_timesteps=int(timesteps) if timesteps else None,
     iterations=int(iterations) if iterations else None,
     floor_frac=floor_frac, order_cap_mult=cap_mult,
     training_forecasts=training_forecasts, early_stop=early_stop,
 )
-if is_torch_agent(agent):
-    per_it = windows_per_iteration(agent, spec.agent_params)
-    group = f" ({spec.agent_params.get('batch_windows')} windows × group of {spec.agent_params.get('group_size')})" \
-        if agent == "grpo" else ""
-    o3.caption(f"{per_it:,} rollouts per iteration{group} · {spec.total_timesteps:,} environment steps")
+per_it = windows_per_iteration(agent, spec.agent_params)
+group = f" ({spec.agent_params.get('batch_windows')} windows × group of {spec.agent_params.get('group_size')})" \
+    if agent == "grpo" else ""
+o3.caption(f"{per_it:,} rollouts per iteration{group} · {spec.total_timesteps:,} environment steps")
 errors = validate_spec(spec, measure_ids)
 try:
     seeds = [int(x) for x in seeds_txt.replace(",", " ").split()]

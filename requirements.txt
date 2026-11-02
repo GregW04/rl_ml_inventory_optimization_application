@@ -7,7 +7,6 @@ mlflow==3.14.0  # pinned: SQLite schema must match the CLI used for `mlflow ui`
 optuna>=3.4.0
 streamlit>=1.32.0
 gymnasium>=0.29.0
-stable-baselines3>=2.2.0
 torch>=2.0.0
 holidays>=0.38
 python-dateutil>=2.8.0

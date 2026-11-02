@@ -23,7 +23,7 @@ st.set_page_config(page_title="Inventory Optimization", page_icon="📦", layout
 st.title("📦 RL-ML Inventory Optimization")
 st.caption(
     "Two-stage VN2 workflow: forecast the measures you choose (refit every n weeks, one "
-    "model or an ensemble) → lost-sales anchor → RL (PPO, GRPO or the DQN baseline; residual "
+    "model or an ensemble) → lost-sales anchor → RL (PPO or GRPO; residual "
     "on the anchor, or raw) trained on train, selected on validation, shipped to test once. "
     "Costs are reported in euros (€)."
 )

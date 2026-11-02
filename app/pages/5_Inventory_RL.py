@@ -424,18 +424,17 @@ with tab_orders:
         what = "order" if spec.method == "raw" else "correction"
         effects = drivers(env, agent, obs).head(6)
         c2.markdown(f"**What moves the RL {what}**")
-        dqn_note = " DQN picks from fixed steps, so small changes often move nothing." if spec.agent == "dqn" else ""
         if e.get("gated_off"):
             c2.caption("Outside the validation gate: the RL policy isn't used for this demand class.")
         elif effects.empty or effects["effect_units"].abs().max() < 0.05:
-            c2.caption(f"No single input moves the RL {what} at this decision.{dqn_note}")
+            c2.caption(f"No single input moves the RL {what} at this decision.")
         else:
             effects = effects.assign(label=[f"{n} ({v:.0f})" for n, v in zip(effects["input"], effects["value"])])
             c2.altair_chart(rl_charts.drivers_chart(effects, f"Change in the RL {what} (units)"), width="stretch")
             c2.caption(
                 f"How the RL {what} would change if one input (current value in brackets) were higher by 10% of this "
                 f"SKU's peak weekly sales (+{effects['change'].iloc[0]:.1f} units), the others and the base-stock order "
-                f"fixed. A local what-if: inputs interact, so the bars don't add up.{dqn_note}"
+                f"fixed. A local what-if: inputs interact, so the bars don't add up."
             )
         if pd.notna(row.get("validation € RL")):
             st.caption(

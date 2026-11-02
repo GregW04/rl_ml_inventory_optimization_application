@@ -54,7 +54,7 @@ def policy_dir(config: dict, rl_run_id: str) -> Path:
 
 
 def load_policy(config: dict, rl_run_id: str):
-    """(spec, agent) saved by a training run (DQN ``model.zip`` or PPO / GRPO ``model.pt``)."""
+    """(spec, agent) saved by a training run (PPO / GRPO ``model.pt``; retired DQN runs raise)."""
     d = policy_dir(config, rl_run_id)
     spec = PolicySpec.load(d / "spec.json")
     return spec, load_agent(spec.agent, d)

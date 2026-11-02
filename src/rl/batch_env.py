@@ -117,7 +117,7 @@ class BatchVN2Env:
 
     def __init__(self, spec: PolicySpec, arrays: EpisodeArrays, rules: VN2Rules):
         if spec.agent == "dqn":
-            raise ValueError("BatchVN2Env replays continuous actions; DQN trains on VN2Env.")
+            raise ValueError("BatchVN2Env replays continuous actions; DQN was retired.")
         if rules.lead_time_weeks != 2:
             raise ValueError("BatchVN2Env implements the VN2 lead time of 2 weeks.")
         f64 = torch.float64

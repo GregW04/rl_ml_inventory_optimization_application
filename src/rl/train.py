@@ -1,8 +1,9 @@
 """
 Train inventory agents on one forecasting run, one MLflow run per seed.
 
-Agents: DQN on Stable-Baselines3 (the baseline), and PPO and GRPO on the batched replay
-of :mod:`src.rl.batch_env` (:mod:`src.rl.ppo`, :mod:`src.rl.grpo`).
+Agents: PPO and GRPO on the batched replay of :mod:`src.rl.batch_env` (:mod:`src.rl.ppo`,
+:mod:`src.rl.grpo`). DQN (Stable-Baselines3) was retired on 2026-11-02; its runs keep their
+metrics and episodes in MLflow.
 
 Protocol: fit on the ``rl_train`` windows for the full budget, keep the final weights,
 then score them once on ``rl_val`` next to the anchor. Every agent is scored by the same
@@ -20,19 +21,16 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import gymnasium as gym
 import mlflow
 import numpy as np
 import pandas as pd
-from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.vec_env import VecNormalize
 
 from src.forecasting.measures import Measure, run_measures
 from src.forecasting.periods import fetch_run_file, load_run_setup
 from src.forecasting.preprocessing import load_initial_state, load_panel_from_config
-from src.rl.agents import build_agent, model_file, wrap_vec_env
+from src.rl.agents import model_file
 from src.rl.rollout import anchor_baseline, per_class_delta, per_class_units, rollout, units_vs_anchor
-from src.rl.spec import STEPS_PER_EPISODE, PolicySpec, is_torch_agent, validate_spec
+from src.rl.spec import PolicySpec, validate_spec
 from src.rl.vn2_data import _PANEL_COLS, build_forecast_lookup, build_vn2_episodes, compute_demand_scales
 from src.simulation.anchor import AnchorSpec, resolve_anchor
 from src.simulation.vn2 import VN2Rules
@@ -133,57 +131,10 @@ def runs_dir(config: dict) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Training environment + callbacks
-# ---------------------------------------------------------------------------
-
-class MultiSKUInventoryEnv(gym.Env):
-    """Sample a random (SKU, window) VN2 episode each reset."""
-
-    def __init__(
-        self,
-        spec: PolicySpec,
-        episodes: dict,
-        lookup: dict,
-        demand_scales: dict[tuple[int, int], float],
-        rules: VN2Rules,
-        seed: int = 42,
-    ):
-        super().__init__()
-        if not episodes:
-            raise ValueError("No RL episodes available; run the forecasting pipeline first.")
-        self.spec = spec
-        self.episodes = episodes
-        self.episode_keys = list(episodes.keys())
-        self.lookup = lookup
-        self.demand_scales = demand_scales
-        self.rules = rules
-        self._rng = np.random.default_rng(seed)
-        probe = VN2Env(spec, episodes[self.episode_keys[0]], lookup, 1.0, rules)
-        self.observation_space = probe.observation_space
-        self.action_space = probe.action_space
-        self._inner: VN2Env | None = None
-
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        if seed is not None:
-            self._rng = np.random.default_rng(seed)
-        key = self.episode_keys[int(self._rng.integers(0, len(self.episode_keys)))]
-        self._inner = VN2Env(
-            self.spec, self.episodes[key], self.lookup, self.demand_scales.get(key[:2], 1.0), self.rules
-        )
-        return self._inner.reset(seed=seed, options=options)
-
-    def step(self, action):
-        assert self._inner is not None
-        return self._inner.step(action)
-
-
-# ---------------------------------------------------------------------------
 # In-sample learning curve (display only: weights are never picked from it)
 # ---------------------------------------------------------------------------
 
 INSAMPLE_WINDOWS = 2_000
-CURVE_POINTS = 10
 CURVE_METRIC = "insample_vs_anchor_pct"
 UNITS_METRIC = "insample_units_vs_anchor_pct"
 
@@ -195,43 +146,6 @@ def insample_keys(train_eps: dict, n: int = INSAMPLE_WINDOWS, seed: int = 123) -
         return []
     rng = np.random.default_rng(seed)
     return [keys[i] for i in rng.choice(len(keys), min(n, len(keys)), replace=False)]
-
-
-class InSampleCurve(BaseCallback):
-    """DQN: cost against the anchor on a fixed sample of training windows, about 10 times a run."""
-
-    def __init__(self, spec: PolicySpec, sub_eps: dict, data: RunData, every: int, lookup: dict | None = None):
-        super().__init__()
-        self.spec, self.sub_eps, self.data = spec, sub_eps, data
-        self.lookup = data.lookup if lookup is None else lookup
-        self.every, self.next = max(1, int(every)), max(1, int(every))
-        base_spec, base_policy = anchor_baseline(spec)
-        kpis, eps = rollout(base_policy, base_spec, sub_eps, self.lookup, data.scales, data.rules)
-        self.anchor_cost = kpis["window_cost_eur"]
-        self.anchor_units = float(eps["units"].sum()) if len(eps) else 0.0
-        self.points: list[tuple[int, float]] = []
-
-    def record(self, model, steps: int) -> None:
-        kpis, eps = rollout(model, self.spec, self.sub_eps, self.lookup, self.data.scales, self.data.rules)
-        pct = 100.0 * (kpis["window_cost_eur"] / self.anchor_cost - 1.0) if self.anchor_cost > 0 else 0.0
-        units = 100.0 * (float(eps["units"].sum()) / self.anchor_units - 1.0) if self.anchor_units > 0 else 0.0
-        windows = int(steps // STEPS_PER_EPISODE)
-        metrics = {CURVE_METRIC: pct, UNITS_METRIC: units}
-        if steps > 0:  # DQN updates its exploration rate only once it steps
-            metrics["exploration_rate"] = float(model.exploration_rate)
-        mlflow.log_metrics(metrics, step=windows)
-        self.points.append((windows, pct))
-        print(f"[dqn] step {steps:>9,} · training-sample cost vs anchor {pct:+.2f}%", flush=True)
-
-    def _on_training_start(self) -> None:
-        self.record(self.model, 0)
-
-    def _on_step(self) -> bool:
-        # The last point is scored after learn(): DQN still takes a gradient step after its last callback.
-        if self.next <= self.num_timesteps < self.spec.total_timesteps:
-            self.record(self.model, self.num_timesteps)
-            self.next += self.every
-        return True
 
 
 def log_curve_chart(points: list[tuple[int, float]], title: str) -> None:
@@ -282,28 +196,6 @@ def validate(agent, spec: PolicySpec, data: RunData, episodes: dict) -> tuple[di
     for cls, value in per_class_units(per_ep).items():
         metrics[f"val_units_vs_anchor_pct_{cls.lower()}"] = value
     return metrics, per_ep
-
-
-def _train_dqn(spec: PolicySpec, data: RunData, train_eps: dict, sub_keys: list, lookup: dict):
-    """Stable-Baselines3 DQN on the episode sampler; returns (agent, VecNormalize, curve points)."""
-
-    def _make_env():
-        return MultiSKUInventoryEnv(spec, train_eps, lookup, data.scales, data.rules, seed=spec.seed)
-
-    # Normalize rewards only (observations are already scaled and clipped in the env).
-    vec_env = VecNormalize(
-        wrap_vec_env(_make_env, n_envs=1),
-        norm_obs=False,
-        norm_reward=True,
-        clip_reward=10.0,
-        gamma=spec.agent_params.get("gamma", 0.99),
-    )
-    agent = build_agent("dqn", vec_env, spec.agent_params, seed=spec.seed)
-    curve = InSampleCurve(spec, {k: train_eps[k] for k in sub_keys}, data,
-                          every=spec.total_timesteps // CURVE_POINTS, lookup=lookup)
-    agent.learn(total_timesteps=spec.total_timesteps, callback=curve)
-    curve.record(agent, spec.total_timesteps)
-    return agent, vec_env, curve.points
 
 
 def _train_torch(spec: PolicySpec, data: RunData, train_eps: dict, sub_keys: list, lookup: dict):
@@ -408,8 +300,6 @@ def train_agent(
             params["floor_frac"] = spec.floor_frac
         else:
             params["order_cap_mult"] = spec.order_cap_mult
-        if spec.buckets:
-            params["buckets"] = str(spec.buckets)
         mlflow.log_params(params)
 
         run_dir = runs_dir(config) / run.info.run_id
@@ -419,13 +309,8 @@ def train_agent(
             print("[train] training forecasts corrected per cell: "
                   + ", ".join(f"{r.fit}/{r.demand_class} ×{r.factor:.3f}" for r in bias_factors.itertuples()),
                   flush=True)
-        if is_torch_agent(spec.agent):
-            agent, points = _train_torch(spec, data, train_eps, sub_keys, train_lookup)
-            agent.save(run_dir / model_file(spec.agent))
-        else:
-            agent, vec_env, points = _train_dqn(spec, data, train_eps, sub_keys, train_lookup)
-            agent.save(str(run_dir / model_file(spec.agent)))
-            vec_env.save(str(run_dir / "vecnormalize.pkl"))
+        agent, points = _train_torch(spec, data, train_eps, sub_keys, train_lookup)
+        agent.save(run_dir / model_file(spec.agent))
         summary = {"final_insample_vs_anchor_pct": points[-1][1]} if points else {}
         if summary:
             mlflow.log_metrics(summary)

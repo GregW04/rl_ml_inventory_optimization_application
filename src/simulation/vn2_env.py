@@ -46,9 +46,9 @@ class VN2Env(gym.Env):
     Actions (``spec.method``):
 
     - ``residual``: ``order = max(0, round(anchor + f · max(anchor, floor_frac · scale)))``
-      with ``f ∈ [−1, 1]`` (PPO) or a bucket value (DQN); ``f = 0`` is the anchor.
-    - ``raw``: ``order = round(f · order_cap_mult · scale)`` with ``f ∈ [0, 1]``; PPO's
-      ``a ∈ [−1, 1]`` maps to ``f = (a + 1) / 2``, DQN picks a bucket value.
+      with ``f ∈ [−1, 1]``; ``f = 0`` is the anchor.
+    - ``raw``: ``order = round(f · order_cap_mult · scale)`` with ``f ∈ [0, 1]``; the action
+      ``a ∈ [−1, 1]`` maps to ``f = (a + 1) / 2``.
 
     ``scale`` is the SKU's peak weekly sales in the training history. The observation
     lists ``spec.state`` in order; features in units of demand are divided by ``scale``.
@@ -91,10 +91,7 @@ class VN2Env(gym.Env):
         self.observation_space = spaces.Box(
             low=low, high=np.full(len(spec.state), _OBS_HIGH, dtype=np.float32), dtype=np.float32
         )
-        if spec.agent == "dqn":
-            self.action_space = spaces.Discrete(len(spec.buckets))
-        else:
-            self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
 
     # ------------------------------------------------------------------
     # State
@@ -169,13 +166,9 @@ class VN2Env(gym.Env):
 
     def unrounded_order(self, action) -> float:
         """Order for ``action`` in the current round, before rounding and the floor at zero."""
-        if self.spec.agent == "dqn":
-            f = float(self.spec.buckets[int(np.asarray(action).reshape(-1)[0])])
-        else:
-            f = float(np.clip(np.asarray(action, dtype=float).reshape(-1)[0], -1.0, 1.0))
+        f = float(np.clip(np.asarray(action, dtype=float).reshape(-1)[0], -1.0, 1.0))
         if self.spec.method == "raw":
-            if self.spec.agent != "dqn":
-                f = (f + 1.0) / 2.0
+            f = (f + 1.0) / 2.0
             return f * self.spec.order_cap_mult * self.demand_scale
         anchor_q = float(self._decision.order)
         return anchor_q + f * max(anchor_q, self.spec.floor_frac * self.demand_scale)

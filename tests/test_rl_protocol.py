@@ -28,7 +28,7 @@ ROOT = get_project_root()
 )
 @pytest.mark.parametrize(
     ("agent", "training_forecasts"),
-    [("dqn", "as_is"), ("ppo", "unbiased_by_class"), ("grpo", "as_is")],
+    [("ppo", "unbiased_by_class"), ("grpo", "as_is")],
 )
 def test_train_validate_select_and_lock_test(tmp_path: Path, monkeypatch, agent: str, training_forecasts: str):
     config = load_config()
@@ -52,13 +52,10 @@ def test_train_validate_select_and_lock_test(tmp_path: Path, monkeypatch, agent:
     spec = build_spec(
         config, str(data.run_id), "residual", agent,
         default_state("residual", data.measure_ids), data.default_anchor,
-        total_timesteps=300 if agent == "dqn" else None, iterations=None if agent == "dqn" else 2,
+        iterations=2,
         training_forecasts=training_forecasts,
     )
-    if agent == "dqn":
-        spec.agent_params["learning_starts"] = 50
-    else:
-        spec.agent_params.update({"batch_windows": 8, "minibatch_size": 64, "group_size": 2})
+    spec.agent_params.update({"batch_windows": 8, "minibatch_size": 64, "group_size": 2})
     results = rl_train.train_seeds(spec, [42, 7], config)
 
     assert blocks == ["rl_train", "rl_val"]

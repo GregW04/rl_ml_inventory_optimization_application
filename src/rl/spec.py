@@ -17,12 +17,14 @@ from pathlib import Path
 from src.simulation.anchor import AnchorSpec
 
 METHODS = ("residual", "raw")
-# DQN trains on Stable-Baselines3 (the baseline); PPO and GRPO train on the batched
-# replay in src.rl.batch_env (src.rl.ppo, src.rl.grpo).
-AGENTS = ("dqn", "ppo", "grpo")
-TORCH_AGENTS = ("ppo", "grpo")
+# PPO and GRPO train on the batched replay in src.rl.batch_env (src.rl.ppo, src.rl.grpo).
+# DQN (Stable-Baselines3) was retired on 2026-11-02: its saved specs still load and keep their
+# config keys, so old runs stay on the leaderboard, but it can't be trained or loaded.
+AGENTS = ("ppo", "grpo")
+TORCH_AGENTS = AGENTS
+RETIRED_AGENTS = ("dqn",)
 AGENT_LABELS = {
-    "dqn": "DQN · Stable-Baselines3 baseline",
+    "dqn": "DQN · retired",
     "ppo": "PPO · batched replay, reward paired with the anchor",
     "grpo": "GRPO · groups of rollouts per window",
 }
@@ -69,7 +71,7 @@ def windows_per_iteration(agent: str, params: dict) -> int:
 
 
 def torch_env_steps(agent: str, params: dict) -> int:
-    """Environment steps of a PPO / GRPO run, comparable with DQN's ``total_timesteps``."""
+    """Environment steps of a PPO / GRPO run, comparable across agents."""
     return int(params.get("iterations", 0) or 0) * windows_per_iteration(agent, params) * STEPS_PER_EPISODE
 
 
@@ -89,7 +91,7 @@ class PolicySpec:
     anchor: AnchorSpec
     floor_frac: float = 0.25
     order_cap_mult: float = 1.0
-    buckets: list[float] | None = None
+    buckets: list[float] | None = None  # DQN only (retired); kept so its specs load
     seed: int = 42
     total_timesteps: int = 100_000
     # Agent hyperparameters (``rl.agents.<agent>`` at training time), so the spec and
@@ -140,7 +142,9 @@ def validate_spec(spec: PolicySpec, measure_ids: list[str]) -> list[str]:
     errors: list[str] = []
     if spec.method not in METHODS:
         errors.append(f"Unknown method '{spec.method}'.")
-    if spec.agent not in AGENTS:
+    if spec.agent in RETIRED_AGENTS:
+        errors.append(f"Agent '{spec.agent}' was retired; train PPO or GRPO.")
+    elif spec.agent not in AGENTS:
         errors.append(f"Unknown agent '{spec.agent}'.")
     known = (
         set(INVENTORY_FEATURES) | set(ANCHOR_FEATURES) | set(CONTEXT_FEATURES) | set(CLASS_FEATURES)
@@ -157,8 +161,6 @@ def validate_spec(spec: PolicySpec, measure_ids: list[str]) -> list[str]:
     missing_anchor = sorted(spec.anchor.inputs() - set(measure_ids))
     if missing_anchor:
         errors.append(f"Anchor inputs not in this forecasting run: {missing_anchor}.")
-    if spec.agent == "dqn" and not spec.buckets:
-        errors.append("DQN needs a list of action buckets.")
     if spec.training_forecasts not in TRAINING_FORECASTS:
         errors.append(f"Training forecasts must be one of {list(TRAINING_FORECASTS)}.")
     elif spec.training_forecasts != "as_is" and not {"mean_h0", "mean_h1"} & set(measure_ids):
@@ -195,7 +197,6 @@ def build_spec(
     state: list[str],
     anchor: AnchorSpec,
     *,
-    total_timesteps: int | None = None,
     iterations: int | None = None,
     floor_frac: float | None = None,
     order_cap_mult: float | None = None,
@@ -205,26 +206,23 @@ def build_spec(
 ) -> PolicySpec:
     """Spec with action parameters and agent hyperparameters filled from the config.
 
-    DQN's budget is ``total_timesteps``. PPO and GRPO budget in ``iterations`` (each one
-    replays a batch of windows); their ``total_timesteps`` is derived so budgets compare.
+    PPO and GRPO budget in ``iterations`` (each one replays a batch of windows);
+    ``total_timesteps`` is derived from it so budgets compare across agents.
     ``early_stop`` overrides the config's ``EARLY_STOP_KEYS`` for PPO / GRPO; with early
     stopping off they are left out, so configuration keys of runs saved before the option
     existed still match.
     """
-    mcfg = config["rl"]["methods"][method]
+    if agent not in AGENTS:
+        raise ValueError(f"Unknown or retired agent '{agent}'; choose from {list(AGENTS)}.")
     params = dict(config["rl"]["agents"][agent])
-    if agent in TORCH_AGENTS:
-        params.pop("total_timesteps", None)
-        if iterations is not None:
-            params["iterations"] = int(iterations)
-        params.update(early_stop or {})
-        if not params.get("early_stop"):
-            for key in EARLY_STOP_KEYS:
-                params.pop(key, None)
-        steps = torch_env_steps(agent, params)
-    else:
-        steps = int(total_timesteps or params.pop("total_timesteps", 100_000))
-        params.pop("total_timesteps", None)
+    params.pop("total_timesteps", None)
+    if iterations is not None:
+        params["iterations"] = int(iterations)
+    params.update(early_stop or {})
+    if not params.get("early_stop"):
+        for key in EARLY_STOP_KEYS:
+            params.pop(key, None)
+    steps = torch_env_steps(agent, params)
     return PolicySpec(
         forecast_run_id=forecast_run_id,
         method=method,
@@ -235,7 +233,6 @@ def build_spec(
         order_cap_mult=float(
             order_cap_mult if order_cap_mult is not None else config["rl"]["methods"]["raw"]["order_cap_mult"]
         ),
-        buckets=[float(b) for b in mcfg["dqn_buckets"]] if agent == "dqn" else None,
         seed=int(seed if seed is not None else config.get("project", {}).get("seed", 42)),
         total_timesteps=steps,
         agent_params=params,

@@ -66,11 +66,6 @@ def test_raw_action_mapping():
     assert env.resolve_order(np.array([-1.0])) == 0.0
     assert env.resolve_order(np.array([1.0])) == 20.0
     assert env.resolve_order(np.array([0.0])) == 10.0
-    dqn = replace(spec, agent="dqn", buckets=[0.0, 0.25, 1.0])
-    env = VN2Env(dqn, _episode(), LOOKUP, demand_scale=10.0, rules=RULES)
-    env.reset()
-    assert env.action_space.n == 3
-    assert env.resolve_order(1) == 5.0
 
 
 class _OnHandPolicy:
@@ -130,7 +125,7 @@ def test_rollout_gate_orders_the_anchor_outside_the_gate():
     assert rollout(more, _spec(), *data, gate=("Smooth",))[0]["window_cost_eur"] == pytest.approx(ungated)
     assert rollout(more, _spec(), *data, gate=("Lumpy",))[0]["window_cost_eur"] == pytest.approx(anchor)
     # A raw policy outside the gate orders the anchor too, not its own zero action.
-    raw = _spec(method="raw", agent="dqn", buckets=[0.0, 1.0], state=default_state("raw", MEASURES))
+    raw = _spec(method="raw", state=default_state("raw", MEASURES))
     assert rollout(_Constant(1), raw, *data, gate=())[0]["window_cost_eur"] == pytest.approx(anchor)
 
 
@@ -152,7 +147,7 @@ def test_class_gate_keeps_the_classes_won_over_seeds():
 
 
 def test_anchor_baseline_matches_for_raw_specs():
-    raw = _spec(method="raw", agent="dqn", buckets=[0.0, 1.0], state=default_state("raw", MEASURES))
+    raw = _spec(method="raw", state=default_state("raw", MEASURES))
     base_spec, policy = anchor_baseline(raw)
     eps = {(1, 2, DATES[0]): _episode()}
     a, _ = rollout(policy, base_spec, eps, LOOKUP, {(1, 2): 10.0}, RULES)
@@ -166,5 +161,9 @@ def test_spec_validation_and_config_key():
     assert any("not available" in e for e in validate_spec(replace(spec, state=spec.state + ["q90_h2"]), MEASURES))
     assert any("inventory pipeline" in e for e in validate_spec(replace(spec, state=["q83_h2"]), MEASURES))
     assert spec.config_key() == spec.with_seed(7).config_key()
-    assert spec.config_key() != replace(spec, agent="dqn", buckets=[0.0]).config_key()
+    assert spec.config_key() != replace(spec, agent="grpo").config_key()
     assert PolicySpec.from_dict(spec.to_dict()) == spec
+    # Specs of the retired DQN still load with their old key (leaderboards keep them) but can't train.
+    old = replace(spec, agent="dqn", buckets=[0.0, 1.0])
+    assert PolicySpec.from_dict(old.to_dict()).config_key() == old.config_key() != spec.config_key()
+    assert any("retired" in e for e in validate_spec(old, MEASURES))
