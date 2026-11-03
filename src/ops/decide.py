@@ -1,6 +1,6 @@
 """
 The decision engine: a pure function from this week's signals to one action, in priority order.
-It reads and writes nothing, so every branch is unit-tested (tests/test_ops_decide.py).
+It reads and writes nothing, so every branch is unit-tested (tests/test_ops_units.py).
 
 1. no champion yet → **bootstrap**
 2. the champion is on probation and its realised € is worse than the shadow on the previous
@@ -11,6 +11,16 @@ It reads and writes nothing, so every branch is unit-tested (tests/test_ops_deci
    cooldown. Drift alarms only count in classes carrying ≥ ``min_cost_share`` of the cost
    → **refit** (same recipe)
 5. otherwise → **keep**. Input-side diagnostics alone never retrain.
+
+The policy layer decides separately (``decide_policy``):
+
+1. no policy yet → **bootstrap** (the anchor, version 1)
+2. an RL policy whose realised € is worse than the anchor's shadow by more than the margin over
+   the latest evidence weeks, with the CI above 0 → **fallback** to the anchor
+3. RL disabled, or the forecast ledger too short to train on → **keep**
+4. never trained, the last challenger ``retrain_every_weeks`` ago, or (RL serving) more than
+   ``gate_churn_limit`` of the SKUs crossed its gate since it was trained → **retrain**
+5. otherwise → **keep**
 """
 
 from __future__ import annotations
@@ -20,6 +30,7 @@ from dataclasses import asdict, dataclass, field
 from src.ops.settings import Rules
 
 ACTIONS = ("bootstrap", "rollback", "refit", "keep")
+POLICY_ACTIONS = ("bootstrap", "fallback", "retrain", "keep")
 
 
 @dataclass
@@ -72,3 +83,30 @@ def decide(signals: dict, rules: Rules) -> Decision:
             return Decision("keep", [f"drift alarms wait for the cooldown ({age} < {rules.cooldown_weeks} weeks)", *alarms])
         reasons.extend(alarms)
     return Decision("refit", reasons) if reasons else Decision("keep", ["no trigger"])
+
+
+def decide_policy(signals: dict, rules: Rules) -> Decision:
+    pr = rules.policy
+    policy = signals.get("policy")
+    if not policy:
+        return Decision("bootstrap", ["no policy yet: the anchor"])
+    if policy["kind"] == "ppo":
+        e = signals.get("policy_vs_anchor")
+        if e and e.get("evidence_weeks", 0) >= pr.min_evidence_weeks and e["delta_pct"] > pr.fallback_margin_pct and e["ci_lo"] > 0:
+            return Decision("fallback", [
+                f"RL costs {e['delta_pct']:+.2f}% vs the anchor over {e['evidence_weeks']} weeks "
+                f"(CI {e['ci_lo']:+.2f}…{e['ci_hi']:+.2f}%)"])
+    if not pr.enabled:
+        return Decision("keep", ["RL disabled"])
+    if not signals.get("rl_eligible"):
+        return Decision("keep", ["the forecast ledger is too short to train RL"])
+    since = policy.get("weeks_since_rl_attempt")
+    if since is None:
+        return Decision("retrain", ["first RL challenger"])
+    if since >= pr.retrain_every_weeks:
+        return Decision("retrain", [f"last RL challenger {since} weeks ago (every {pr.retrain_every_weeks})"])
+    churn = signals.get("gate_churn")
+    if policy["kind"] == "ppo" and churn is not None and churn > pr.gate_churn_limit:
+        return Decision("retrain", [f"{churn:.1%} of SKUs crossed the gate (limit {pr.gate_churn_limit:.0%})"])
+    return Decision("keep", ["no trigger"])
+

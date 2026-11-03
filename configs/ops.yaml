@@ -33,6 +33,29 @@ rules:
   sanity:
     # A refit's decision-week forecast total may differ from the champion's by at most this.
     max_total_change_pct: 30.0
+  policy:
+    # The RL layer. Every environment starts with the anchor as its policy; once the as-issued
+    # forecast ledger covers train_weeks + val_weeks + 4 burn-in weeks, a PPO challenger is trained
+    # on it (steady state: no VN2-window features) and must beat the anchor on the last val_weeks.
+    enabled: true
+    agent: ppo
+    method: residual
+    training_forecasts: unbiased_by_class
+    # On top of config rl.agents.ppo: the research champion (σ 0.30 start, early stop on the
+    # training sample, budget 2000 iterations).
+    agent_params: {iterations: 2000, init_log_std: -1.204, early_stop: true, early_stop_patience: 400,
+                   early_stop_min_delta: 0.2, early_stop_every: 100}
+    seeds: [42, 43, 44]
+    train_weeks: 26
+    val_weeks: 8
+    retrain_every_weeks: 13
+    gate_churn_limit: 0.10
+    promote_margin_pct: 0.5
+    units_band_pct: 2.0
+    min_seed_share: 0.67
+    fallback_margin_pct: 0.5
+    evidence_weeks: 4
+    min_evidence_weeks: 2
   n_boot: 1000
   seed: 42
 

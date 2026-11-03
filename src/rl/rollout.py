@@ -9,8 +9,8 @@ import pandas as pd
 
 from src.forecasting.features.demand_profile import DEMAND_CLASSES, UNCLASSIFIED
 from src.rl.spec import PolicySpec
+from src.rl.vn2_env import VN2Env
 from src.simulation.vn2 import VN2Rules
-from src.simulation.vn2_env import VN2Env
 
 
 class ZeroResidual:

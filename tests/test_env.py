@@ -12,9 +12,9 @@ from src.rl.explain import drivers, explain_order
 from src.rl.rollout import ZeroResidual, anchor_baseline, rollout, vs_anchor
 from src.rl.selection import class_gate, gate_episodes
 from src.rl.spec import UNITLESS_FEATURES, PolicySpec, default_state, validate_spec
+from src.rl.vn2_env import VN2Env
 from src.simulation.anchor import AnchorSpec
 from src.simulation.vn2 import VN2Rules
-from src.simulation.vn2_env import VN2Env
 
 RULES = VN2Rules()
 ANCHOR = AnchorSpec("mean_h0", "mean_h1", "quantile", ("q83_h2",), 0.8333)

@@ -1,7 +1,7 @@
 """
 Batched replay of VN2 windows for training PPO and GRPO.
 
-``BatchVN2Env`` is a tensor twin of :class:`src.simulation.vn2_env.VN2Env`: the same
+``BatchVN2Env`` is a tensor twin of :class:`src.rl.vn2_env.VN2Env`: the same
 observation features, scaling and clipping, the same lost-sales anchor, the same residual
 and raw order rules (rounded half to even, as Python's ``round``), and the same weekly
 costs scored from week 3. It steps thousands of SKU-windows at once and runs a shadow

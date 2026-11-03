@@ -1,18 +1,23 @@
 """
 The weekly cycle of an ops environment, one function per step (``python -m src.ops.cli step``):
 
-    ingest → score → monitor → decide → refit → forecast → order → report
+    ingest → score → monitor → decide → refit → forecast → retrain → order → report
 
 Cycle ``as_of = D`` (the drop's last week) realises week D on every trajectory with the order
-decided in cycle D−1, reads the monitors, decides, maybe refits / promotes / rolls back, then
-issues the forecasts for decision week D+1 from ``@champion`` (and from ``@previous`` while a new
-champion is on probation) and decides the orders for D+1.
+decided in cycle D−1, reads the monitors, decides, maybe refits / promotes / rolls back the
+forecaster, issues the forecasts for decision week D+1 from ``@champion`` (and from ``@previous``
+while a new forecaster is on probation), maybe trains / promotes / falls back the policy, and
+decides the orders for D+1 with the registered policy (``src/ops/rl.py``).
+
+Trajectories: ``live`` (champion forecaster, champion policy), ``previous`` (the previous
+forecaster under the same policy, while a new forecaster is on probation) and ``anchor`` (the
+champion forecaster under the anchor, while an RL policy serves).
 
 Each step reads and writes the cycle folder ``ops/<env>/cycles/<D>/``; re-running a step
 overwrites its outputs. MLflow: one run per cycle, a child of the environment's timeline run,
 holds the cycle's tags, metrics, input data and files; a refit is a child run of its cycle that
 logs and registers the model. Nothing here imports torch: the forecaster's LightGBM and torch
-can't share a process.
+can't share a process, so a retrain that trains runs in its own process (``run_cycle``).
 """
 
 from __future__ import annotations
@@ -20,6 +25,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -28,6 +35,7 @@ from pathlib import Path
 
 import mlflow
 import pandas as pd
+import yaml
 from mlflow.entities import DatasetInput, InputTag, Metric
 from mlflow.tracking import MlflowClient
 
@@ -35,16 +43,21 @@ from src.forecasting.measures import HORIZONS, infer_measures
 from src.forecasting.model import build_feature_matrix
 from src.forecasting.preprocessing import build_target_columns, load_master, load_sales_panel
 from src.forecasting.recipe import PANEL_COLUMNS, Recipe, fit_recipe, forecast, panel_digest
-from src.ops import contract, drops, ledger, monitor, registry
-from src.ops.decide import Decision, decide
-from src.ops.settings import Env, OpsConfig, Rules, cycle_dir, dump, env_config, env_rules, env_settings, weeks
+from src.ops import contract, drops, ledger, monitor, registry, rl
+from src.ops.decide import Decision, decide, decide_policy
+from src.ops.settings import Env, OpsConfig, Rules, cycle_dir, dump, env_config, env_dir, env_rules, env_settings, weeks
+from src.rl.vn2_data import context_features
 from src.serving.forecaster import log_forecaster
+from src.serving.policy import log_policy
 from src.simulation.anchor import LostSalesAnchor, resolve_anchor
 from src.simulation.vn2 import VN2Rules
 from src.utils import tracking
 
-STEPS = ("ingest", "score", "monitor", "decide", "refit", "forecast", "order", "report")
-TRAJECTORIES = {"live": registry.CHAMPION, "previous": registry.PREVIOUS}  # trajectory → forecaster alias
+STEPS = ("ingest", "score", "monitor", "decide", "refit", "forecast", "retrain", "order", "report")
+# trajectory → (forecaster alias, policy): the registered policy, or the anchor
+TRAJECTORIES = {"live": (registry.CHAMPION, "policy"), "previous": (registry.PREVIOUS, "policy"),
+                "anchor": (registry.CHAMPION, "anchor")}
+ROOT = Path(__file__).resolve().parents[2]
 WEEK = pd.Timedelta(weeks=1)
 KEYS = ledger.KEYS
 
@@ -83,6 +96,15 @@ class Cycle:
     @property
     def model_name(self) -> str:
         return registry.model_name(self.env, "forecaster")
+
+    @property
+    def policy_name(self) -> str:
+        return registry.model_name(self.env, "policy")
+
+    @property
+    def first_forecast_week(self) -> pd.Timestamp:
+        """The first decision week of the environment (forecast by the bootstrap cycle)."""
+        return pd.Timestamp(self.settings.start) + WEEK
 
     def path(self, name: str, previous: bool = False) -> Path:
         return cycle_dir(self.base_config, self.env, self.as_of - WEEK if previous else self.as_of) / name
@@ -185,6 +207,36 @@ def champion_info(c: Cycle) -> dict | None:
             "age_weeks": int((c.as_of - fit) / WEEK), "weeks_since_promotion": int((c.as_of - promoted) / WEEK)}
 
 
+def policy_info(c: Cycle) -> dict | None:
+    mv = registry.resolve(c.policy_name, registry.CHAMPION)
+    if mv is None:
+        return None
+    attempts = [pd.Timestamp(v.tags["as_of"]) for v in MlflowClient().search_model_versions(f"name='{c.policy_name}'")
+                if v.tags.get("kind") == "ppo"]
+    promoted = pd.Timestamp(mv.tags.get("promoted_as_of", mv.tags["as_of"]))
+    return {"version": str(mv.version), "kind": mv.tags["kind"], "fit_as_of": mv.tags["as_of"],
+            "promoted_as_of": str(promoted.date()), "weeks_since_promotion": int((c.as_of - promoted) / WEEK),
+            "gate": json.loads(mv.tags.get("gate") or "null"),
+            "weeks_since_rl_attempt": int((c.as_of - max(attempts)) / WEEK) if attempts else None}
+
+
+@lru_cache(maxsize=4)
+def _context(sales: str, instock: str, master: str, week: str, features: str) -> pd.DataFrame:
+    return context_features(_load_panel(sales, instock, master), pd.Timestamp(week), json.loads(features))
+
+
+def context(c: Cycle) -> pd.DataFrame:
+    """``zero_share``, ``pos_cv`` and the demand-class code of every SKU for decision week D+1."""
+    sales, instock = drops.drop_paths(c.base_config, c.env, c.as_of)
+    feats = json.dumps({"forecasting": {"features": c.config["forecasting"]["features"]}})
+    return _context(str(sales), str(instock), c.config["data"]["master_file"], str((c.as_of + WEEK).date()), feats)
+
+
+def fit_dates(c: Cycle) -> dict[str, str]:
+    """Forecaster version → the as-of week it was fit on."""
+    return {str(v.version): v.tags["as_of"] for v in MlflowClient().search_model_versions(f"name='{c.model_name}'")}
+
+
 def on_probation(c: Cycle) -> bool:
     """A new champion stays on probation until its evidence weeks are realised (and while ``previous`` exists)."""
     info = champion_info(c)
@@ -257,8 +309,11 @@ def step_score(c: Cycle) -> None:
     demand = pd.DataFrame({"store": week["store"].to_numpy(), "product": week["product"].to_numpy(),
                            "demand": week["sales"].fillna(0.0).to_numpy(),
                            "censored": ~week["in_stock"].fillna(True).astype(bool).to_numpy()})
+    policy = policy_info(c)
     for traj in TRAJECTORIES:
-        if not c.has(f"state_{traj}.parquet", previous=True) or (traj == "previous" and not on_probation(c)):
+        if not c.has(f"state_{traj}.parquet", previous=True):
+            continue
+        if (traj == "previous" and not on_probation(c)) or (traj == "anchor" and (policy or {}).get("kind") != "ppo"):
             continue
         state, costs = ledger.realise(c.read(f"state_{traj}.parquet", previous=True), demand, c.vn2)
         c.write(f"state_{traj}.parquet", state)
@@ -287,16 +342,28 @@ def step_monitor(c: Cycle) -> None:
             signals["probation"] = monitor.probation_signal(
                 _ledger(c, "costs_live.parquet", promoted), _ledger(c, "costs_previous.parquet", promoted), promoted, c.rules)
     signals["diagnostics"] = monitor.diagnostics(p, classes, c.as_of, pd.Timestamp(info["fit_as_of"]) if info else None)
+    policy = signals["policy"] = policy_info(c)
+    signals["rl_eligible"] = rl.eligible(c.as_of, c.first_forecast_week, c.rules.policy)
+    if policy and policy["kind"] == "ppo":
+        promoted = pd.Timestamp(policy["promoted_as_of"])
+        if c.has("costs_anchor.parquet"):
+            signals["policy_vs_anchor"] = monitor.policy_signal(
+                _ledger(c, "costs_live.parquet", promoted), _ledger(c, "costs_anchor.parquet", promoted), promoted,
+                c.as_of, c.rules)
+        if policy["gate"]:
+            signals["gate_churn"] = monitor.gate_churn(classes, policy["gate"], pd.Timestamp(policy["fit_as_of"]), c.as_of)
     c.write("signals.json", signals)
 
 
 def step_decide(c: Cycle) -> None:
-    c.write("decision.json", decide(c.read("signals.json"), c.rules).to_dict())
+    signals = c.read("signals.json")
+    c.write("decision.json", {**decide(signals, c.rules).to_dict(), "policy": decide_policy(signals, c.rules).to_dict()})
 
 
 def step_refit(c: Cycle) -> None:
     """Act on the decision: bootstrap or refit (then sanity-check and promote), or roll back."""
-    d, client, name = Decision(**c.read("decision.json")), MlflowClient(), c.model_name
+    raw = c.read("decision.json")
+    d, client, name = Decision(raw["action"], raw["reasons"]), MlflowClient(), c.model_name
     if d.action == "rollback":
         rejected = registry.resolve(name, registry.CHAMPION)
         restored = registry.rollback(name)
@@ -346,26 +413,106 @@ def step_refit(c: Cycle) -> None:
 def step_forecast(c: Cycle) -> None:
     """Forecasts for decision week D+1 from each forecaster that drives a trajectory."""
     history = panel(c)[PANEL_COLUMNS]
-    for traj, alias in TRAJECTORIES.items():
+    aliases = {alias for traj, (alias, _) in TRAJECTORIES.items() if c.has(f"state_{traj}.parquet")}
+    for alias in sorted(aliases):
         mv = registry.resolve(c.model_name, alias)
-        if mv is None or not c.has(f"state_{traj}.parquet"):
-            continue
-        fc = load_model(c, mv).predict(history, params={"as_of": c.day})
-        c.write(f"forecasts_{alias}.parquet", fc.assign(version=str(mv.version)))
+        if mv is not None:
+            fc = load_model(c, mv).predict(history, params={"as_of": c.day})
+            c.write(f"forecasts_{alias}.parquet", fc.assign(version=str(mv.version)))
+
+
+def step_retrain(c: Cycle) -> None:
+    """The policy layer: register the anchor (bootstrap), fall back to it, or train an RL challenger."""
+    d, name, client = c.read("decision.json")["policy"], c.policy_name, MlflowClient()
+    fc = c.read("forecasts_champion.parquet")
+    spec, _ = resolve_anchor(infer_measures(list(fc.columns), c.vn2), c.vn2)
+    example = rl.decision_frame(c.read("state_live.parquet"), fc, context(c)).head(3)
+    if d["action"] == "bootstrap":
+        with mlflow.start_run(run_name=f"policy-bootstrap-{c.day}", experiment_id=experiment_id(c),
+                              parent_run_id=cycle_run(c), tags={"stage": "policy-bootstrap", "env": c.env, "as_of": c.day}):
+            info = log_policy("anchor", spec, c.vn2, example)
+        v = registry.register(info.model_uri, name, {"kind": "anchor", "trigger": "bootstrap", "as_of": c.day,
+                                                     "validation_status": "passed", "promoted_as_of": c.day})
+        registry.promote(name, str(v.version))
+    elif d["action"] == "fallback":
+        rl_version = registry.resolve(name, registry.CHAMPION)
+        anchors = [v for v in client.search_model_versions(f"name='{name}'") if v.tags.get("kind") == "anchor"]
+        anchor_version = str(min(int(v.version) for v in anchors))
+        client.set_model_version_tag(name, str(rl_version.version), "validation_status", "rejected")
+        client.set_model_version_tag(name, str(rl_version.version), "rejected_reason", d["reasons"][0][:500])
+        client.set_model_version_tag(name, anchor_version, "promoted_as_of", c.day)
+        registry.promote(name, anchor_version)
+        c.path("state_anchor.parquet").unlink(missing_ok=True)
+    elif d["action"] == "retrain":
+        _train_policy(c, example)
+
+
+def _train_policy(c: Cycle, example: pd.DataFrame) -> None:
+    """Train PPO on the forecast ledger (torch: runs in its own process), check it, register, promote."""
+    from src.rl.data import block_episodes
+    from src.rl.policy import TorchPolicy
+    from src.rl.train import train_agent
+    from src.serving.policy import actor_arrays
+
+    pr = c.rules.policy
+    fc = _ledger(c, "forecasts_champion.parquet", c.first_forecast_week - WEEK)
+    data = rl.ledger_run_data(panel(c), fc, c.as_of, pr, c.vn2, fit_dates(c))
+    spec = rl.ops_spec(c.config, pr, data, c.env)
+    train_eps, val_eps = block_episodes(c.config, data, "rl_train"), block_episodes(c.config, data, "rl_val")
+    exp, parent = experiment_id(c), cycle_run(c)
+    results = {s: train_agent(spec.with_seed(s), c.config, data, train_eps, val_eps, experiment_id=exp,
+                              parent_run_id=parent, tags={"stage": "rl-train", "env": c.env, "as_of": c.day})
+               for s in pr.seeds}
+    val = {s: pd.read_parquet(Path(r["run_dir"]) / "val_episodes.parquet") for s, r in results.items()}
+    report = rl.challenger_report(val, pr)
+    seed = int(c.config.get("project", {}).get("seed", 42))
+    seed = seed if seed in results else pr.seeds[0]
+    policy = TorchPolicy.load(Path(results[seed]["run_dir"]) / "model.pt")
+    tags = {"kind": "ppo", "trigger": "retrain", "as_of": c.day, "recipe_key": spec.config_key(),
+            "gate": json.dumps(list(report["gate"]) if report["gate"] else None),
+            "val_vs_anchor_pct": f"{report['mean_val_pct']:+.3f}", "seeds_beating_anchor": f"{report['share_beating']:.2f}",
+            "validated_with_forecaster": champion_info(c)["version"], "training_runs": ",".join(r["rl_run_id"] for r in results.values()),
+            "validation_status": "passed" if report["passed"] else "rejected",
+            "rejected_reason": "; ".join(report["failed"])[:500]}
+    with mlflow.start_run(run_name=f"policy-{c.day}", experiment_id=exp, parent_run_id=parent,
+                          tags={"stage": "policy", "env": c.env, "as_of": c.day}):
+        mlflow.log_metrics({"val_vs_anchor_pct": report["mean_val_pct"], "seeds_beating_anchor": report["share_beating"],
+                            **{f"val_vs_anchor_pct_s{s}": v for s, v in report["val_pct"].items()}})
+        info = log_policy("ppo", spec.anchor, c.vn2, example, spec=spec.with_seed(seed), actor=actor_arrays(policy),
+                          scales=data.scales, gate=report["gate"], params={"recipe_key": spec.config_key()})
+    v = str(registry.register(info.model_uri, c.policy_name, tags).version)
+    if report["passed"]:
+        promote_policy(c, v)
+
+
+def promote_policy(c: Cycle, version: str) -> None:
+    """
+    Serve an RL policy version. The anchor's shadow restarts from today's state at every promotion,
+    so the fallback check judges this policy alone, not the stock an earlier one left behind.
+    """
+    MlflowClient().set_model_version_tag(c.policy_name, version, "promoted_as_of", c.day)
+    registry.promote(c.policy_name, version)
+    c.write("state_anchor.parquet", c.read("state_live.parquet"))
 
 
 def step_order(c: Cycle) -> None:
-    """The anchor's orders for decision week D+1 on every trajectory; the live ones go to orders.csv."""
-    for traj, alias in TRAJECTORIES.items():
+    """Orders for decision week D+1: the registered policy on live and previous, the anchor on its shadow."""
+    ctx = context(c)
+    policy = load_model(c, registry.resolve(c.policy_name, registry.CHAMPION))
+    for traj, (alias, kind) in TRAJECTORIES.items():
         if not (c.has(f"state_{traj}.parquet") and c.has(f"forecasts_{alias}.parquet")):
             continue
         fc = c.read(f"forecasts_{alias}.parquet")
-        spec, _ = resolve_anchor(infer_measures(list(fc.columns), c.vn2), c.vn2)
         state = c.read(f"state_{traj}.parquet")
-        state["order"] = ledger.anchor_orders(state, fc, LostSalesAnchor(spec, c.vn2))
-        c.write(f"state_{traj}.parquet", state)
-    live = c.read("state_live.parquet").assign(decision_week=str((c.as_of + WEEK).date()))
-    live[[*KEYS, "decision_week", "order"]].to_csv(c.path("orders.csv"), index=False)
+        if kind == "anchor":
+            spec, _ = resolve_anchor(infer_measures(list(fc.columns), c.vn2), c.vn2)
+            state["order"] = ledger.anchor_orders(state, fc, LostSalesAnchor(spec, c.vn2))
+        else:
+            out = policy.predict(rl.decision_frame(state, fc, ctx))
+            state = state.drop(columns="order").merge(out[[*KEYS, "order"]], on=KEYS, validate="one_to_one")
+            if traj == "live":
+                out.assign(decision_week=str((c.as_of + WEEK).date())).to_csv(c.path("orders.csv"), index=False)
+        c.write(f"state_{traj}.parquet", state[ledger.STATE_COLUMNS])
 
 
 def step_report(c: Cycle) -> None:
@@ -379,6 +526,8 @@ def step_report(c: Cycle) -> None:
                 metrics[f"{traj}_{col}_per_sku"] = float(k[col].mean())
             metrics[f"{traj}_censored_share"] = float(k["censored"].mean())
     metrics["live_units_ordered"] = float(c.read("state_live.parquet")["order"].sum())
+    orders = pd.read_csv(c.path("orders.csv"))
+    metrics["rl_share_of_skus"] = float(orders["rl"].mean())
     signals, decision = c.read("signals.json"), c.read("decision.json")
     if signals.get("champion"):
         metrics["champion_age_weeks"] = float(signals["champion"]["age_weeks"])
@@ -396,7 +545,12 @@ def step_report(c: Cycle) -> None:
     client.log_batch(run_id, metrics=[Metric(k, v, now, 0) for k, v in metrics.items()])
     client.log_batch(timeline_run(c), metrics=[Metric(k, v, now, step) for k, v in metrics.items()])
     champion, previous = (registry.resolve(c.model_name, a) for a in (registry.CHAMPION, registry.PREVIOUS))
+    policy = registry.resolve(c.policy_name, registry.CHAMPION)
     tags = {"decision": decision["action"], "decision_reasons": "; ".join(decision["reasons"])[:500],
+            "policy_decision": decision["policy"]["action"],
+            "policy_reasons": "; ".join(decision["policy"]["reasons"])[:500],
+            "policy_version": "" if policy is None else str(policy.version),
+            "policy_kind": "" if policy is None else policy.tags.get("kind", ""),
             "champion_version": "" if champion is None else str(champion.version),
             "previous_version": "" if previous is None else str(previous.version)}
     for k, v in tags.items():
@@ -415,12 +569,24 @@ def run_step(c: Cycle, name: str) -> None:
     STEP_FUNCS[name](c)
 
 
+def spawn_step(c: Cycle, name: str) -> None:
+    """Run one step in its own process (training imports torch, which can't share a process with LightGBM)."""
+    ops_path = env_dir(c.base_config, c.env) / "ops_config.yaml"
+    ops_path.write_text(yaml.safe_dump(c.ops.model_dump(mode="json"), sort_keys=False), encoding="utf-8")
+    subprocess.run([sys.executable, "-m", "src.ops.cli", "--ops-config", str(ops_path), "--project-root",
+                    str(c.base_config["_project_root"]), "step", name, "--env", c.env, "--as-of", c.day],
+                   cwd=ROOT, check=True)
+
+
 def run_cycle(c: Cycle, force: bool = False) -> str:
     """Every step of one week, in order; a finished week is skipped unless ``force``."""
     if c.has("done") and not force:
         return "skipped"
     for name in STEPS:
-        run_step(c, name)
+        if name == "retrain" and c.read("decision.json")["policy"]["action"] == "retrain":
+            spawn_step(c, name)
+        else:
+            run_step(c, name)
     return "done"
 
 

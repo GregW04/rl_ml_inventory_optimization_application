@@ -54,6 +54,30 @@ class Sanity(_Strict):
     max_total_change_pct: float = 30.0
 
 
+class PolicyRules(_Strict):
+    """The RL layer: when to train a PPO challenger, how it must beat the anchor, when to fall back."""
+
+    enabled: bool = True
+    agent: Literal["ppo", "grpo"] = "ppo"
+    method: Literal["residual", "raw"] = "residual"
+    training_forecasts: Literal["as_is", "unbiased", "unbiased_by_class"] = "unbiased_by_class"
+    # Hyperparameters on top of config rl.agents.<agent> (the research champion's, by default).
+    agent_params: dict = {}
+    seeds: list[int] = [42, 43, 44]
+    train_weeks: int = 26
+    val_weeks: int = 8
+    retrain_every_weeks: int = 13
+    gate_churn_limit: float = 0.10
+    # Promotion on the validation weeks (the gate is picked there, as in research).
+    promote_margin_pct: float = 0.5
+    units_band_pct: float = 2.0
+    min_seed_share: float = 0.67
+    # Fallback to the anchor: the live RL trajectory against the anchor's shadow.
+    fallback_margin_pct: float = 0.5
+    evidence_weeks: int = 4
+    min_evidence_weeks: int = 2
+
+
 class Rules(_Strict):
     strategy: Literal["never", "fixed", "drift", "drift_backstop"] = "drift_backstop"
     max_age_weeks: int = 13
@@ -62,6 +86,7 @@ class Rules(_Strict):
     coverage: Coverage = Coverage()
     probation: Probation = Probation()
     sanity: Sanity = Sanity()
+    policy: PolicyRules = PolicyRules()
     n_boot: int = 1000
     seed: int = 42
 

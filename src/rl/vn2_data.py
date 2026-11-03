@@ -70,6 +70,23 @@ def attach_demand_class(panel: pd.DataFrame, config: dict) -> pd.DataFrame:
     return out
 
 
+def context_features(panel: pd.DataFrame, week: pd.Timestamp, config: dict) -> pd.DataFrame:
+    """
+    ``zero_share``, ``pos_cv`` and ``dp_sbc_class`` of every SKU for the row dated ``week``, from the
+    sales before it: what an episode row of that week carries, for a week whose sales are unknown
+    (the decision week of a served policy). One row per SKU.
+    """
+    week = pd.Timestamp(week)
+    hist = panel.loc[panel["date"] < week, _PANEL_COLS]
+    future = hist.drop_duplicates(["store", "product"]).assign(date=week, sales=np.nan, in_stock=True)
+    full = attach_demand_class(pd.concat([hist, future], ignore_index=True), config)
+    rows = []
+    for _, grp in full.groupby(["store", "product"], observed=True):
+        rows.append(_attach_shape_features(grp).iloc[-1])
+    out = pd.DataFrame(rows)[["store", "product", "zero_share", "pos_cv", "dp_sbc_class"]]
+    return out.astype({"store": "int64", "product": "int64", "dp_sbc_class": "int64"}).reset_index(drop=True)
+
+
 def _attach_shape_features(grp: pd.DataFrame) -> pd.DataFrame:
     grp = grp.sort_values("date").reset_index(drop=True)
     n = len(grp)

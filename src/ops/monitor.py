@@ -106,10 +106,8 @@ def cost_share(costs: pd.DataFrame) -> dict:
     return {str(k): float(v / total) for k, v in by_class.items()} if total > 0 else {}
 
 
-def probation_signal(live: pd.DataFrame, shadow: pd.DataFrame, promoted: pd.Timestamp, rules: Rules) -> dict | None:
-    """Realised € of the live trajectory vs the previous forecaster's shadow, on the weeks they can differ."""
-    first = promoted + (LEAD_WEEKS + 1) * WEEK
-    last = first + (rules.probation.evidence_weeks - 1) * WEEK
+def paired_delta(live: pd.DataFrame, shadow: pd.DataFrame, first: pd.Timestamp, last: pd.Timestamp, rules: Rules) -> dict:
+    """Realised € of the live trajectory against a shadow on weeks ``first``…``last``, with a bootstrap CI over SKUs."""
     cols = [*KEYS, "week", "cost_eur", "censored"]
     both = live[cols].merge(shadow[cols], on=[*KEYS, "week"], suffixes=("_live", "_shadow"))
     both = both[(both["week"] >= first) & (both["week"] <= last) & ~both["censored_live"]]
@@ -128,6 +126,26 @@ def probation_signal(live: pd.DataFrame, shadow: pd.DataFrame, promoted: pd.Time
         "ci_lo": float(np.percentile(boot, 2.5)),
         "ci_hi": float(np.percentile(boot, 97.5)),
     }
+
+
+def probation_signal(live: pd.DataFrame, shadow: pd.DataFrame, promoted: pd.Timestamp, rules: Rules) -> dict:
+    """A new forecaster against the previous one's shadow, on the weeks its orders can affect."""
+    first = promoted + (LEAD_WEEKS + 1) * WEEK
+    return paired_delta(live, shadow, first, first + (rules.probation.evidence_weeks - 1) * WEEK, rules)
+
+
+def policy_signal(live: pd.DataFrame, anchor: pd.DataFrame, promoted: pd.Timestamp, as_of: pd.Timestamp, rules: Rules) -> dict:
+    """An RL policy against the anchor's shadow over the latest evidence weeks since its orders took effect."""
+    first = max(promoted + (LEAD_WEEKS + 1) * WEEK, as_of - (rules.policy.evidence_weeks - 1) * WEEK)
+    return paired_delta(live, anchor, first, as_of, rules)
+
+
+def gate_churn(classes: pd.DataFrame, gate: list[str], fit_as_of: pd.Timestamp, as_of: pd.Timestamp) -> float:
+    """Share of SKUs that moved into or out of the policy's gate since the policy was trained."""
+    a = classes[classes["date"] == as_of].set_index(KEYS)["demand_class"].isin(gate)
+    b = classes[classes["date"] == fit_as_of].set_index(KEYS)["demand_class"].isin(gate)
+    both = a.to_frame("now").join(b.rename("fit"), how="inner")
+    return float((both["now"] != both["fit"]).mean()) if len(both) else 0.0
 
 
 def _psi(a: np.ndarray, b: np.ndarray) -> float:

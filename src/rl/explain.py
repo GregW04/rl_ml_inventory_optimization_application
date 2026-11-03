@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from src.rl.spec import UNITLESS_FEATURES
-from src.simulation.vn2_env import VN2Env
+from src.rl.vn2_env import VN2Env
 
 
 def explain_order(env: VN2Env, agent, obs) -> dict:

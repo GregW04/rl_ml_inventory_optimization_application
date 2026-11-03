@@ -6,15 +6,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+import mlflow
 import numpy as np
 import pandas as pd
 import pytest
 
 from src.forecasting.drift import trigg_signal
 from src.forecasting.preprocessing import load_master
-from src.ops import contract, drops, ledger, monitor
+from src.ops import contract, drops, ledger, monitor, registry, steps
 from src.ops.decide import decide
-from src.ops.settings import Rules
+from src.ops.settings import OpsConfig, Rules
 from src.simulation.anchor import AnchorSpec, LostSalesAnchor
 from src.simulation.vn2 import InventoryState, VN2Rules, step_one_week
 from src.utils.config import load_config
@@ -202,3 +203,92 @@ def test_ops_steps_never_import_torch():
     code = "import sys; import src.ops.steps, src.ops.cli; assert 'torch' not in sys.modules, 'torch imported'"
     res = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True)
     assert res.returncode == 0, res.stderr[-2000:]
+
+
+# ---------------------------------------------------------------------------
+# Policy layer
+# ---------------------------------------------------------------------------
+
+def _policy_signals(kind="anchor", since=None, eligible=True, vs_anchor=None, churn=None):
+    return {"policy": {"kind": kind, "weeks_since_rl_attempt": since}, "rl_eligible": eligible,
+            "policy_vs_anchor": vs_anchor, "gate_churn": churn}
+
+
+@pytest.mark.parametrize("signals, action", [
+    ({}, "bootstrap"),
+    (_policy_signals(eligible=False), "keep"),
+    (_policy_signals(), "retrain"),  # eligible, never trained
+    (_policy_signals(since=5), "keep"),
+    (_policy_signals(since=13), "retrain"),
+    (_policy_signals(kind="ppo", since=3, churn=0.15), "retrain"),
+    (_policy_signals(kind="ppo", since=3, churn=0.05), "keep"),
+    (_policy_signals(kind="ppo", since=3, vs_anchor={"evidence_weeks": 3, "delta_pct": 2.0, "ci_lo": 0.3, "ci_hi": 3.0}), "fallback"),
+    (_policy_signals(kind="ppo", since=3, vs_anchor={"evidence_weeks": 3, "delta_pct": 2.0, "ci_lo": -0.3, "ci_hi": 3.0}), "keep"),
+    (_policy_signals(kind="ppo", since=3, vs_anchor={"evidence_weeks": 1, "delta_pct": 9.0, "ci_lo": 5.0, "ci_hi": 12.0}), "keep"),
+])
+def test_policy_decision_table(signals, action):
+    from src.ops.decide import decide_policy
+
+    assert decide_policy(signals, Rules()).action == action
+
+
+def test_rl_windows_and_eligibility():
+    from src.ops import rl
+    from src.ops.settings import PolicyRules
+
+    pr = PolicyRules(train_weeks=26, val_weeks=8)
+    w = rl.windows(pd.Timestamp("2024-04-01"), pr)
+    assert (w["rl_val_start"], w["rl_val_end"]) == (pd.Timestamp("2024-02-12"), pd.Timestamp("2024-04-01"))
+    assert (w["rl_train_start"], w["rl_train_end"]) == (pd.Timestamp("2023-08-14"), pd.Timestamp("2024-02-05"))
+    first = pd.Timestamp("2022-10-10")  # T0 = 2022-10-03: the first decision week
+    # 38 ledger weeks, counting both ends: 4 burn-in + 26 training + 8 validation.
+    assert not rl.eligible(first + 36 * WEEK, first, pr) and rl.eligible(first + 37 * WEEK, first, pr)
+
+
+def test_forecaster_tenures_become_training_fits():
+    from src.ops import rl
+
+    dates = pd.date_range("2023-01-02", periods=8, freq="7D")
+    fc = pd.DataFrame({"date": dates, "version": ["1", "1", "1", "2", "2", "1", "1", "1"]})
+    fits = rl.version_fits(fc, {"1": "2022-12-26", "2": "2023-01-16"}, dates[0], dates[-1])
+    assert [(f["start"], f["end"], f["fit_end"]) for f in fits] == [
+        ("2023-01-02", "2023-01-16", "2022-12-26"), ("2023-01-23", "2023-01-30", "2023-01-16"),
+        ("2023-02-06", "2023-02-20", "2022-12-26")]  # a rollback starts a new tenure of version 1
+
+
+def test_challenger_report_gates_and_checks_every_seed():
+    from src.ops import rl
+    from src.ops.settings import PolicyRules
+
+    def eps(smooth, lumpy):  # cost per class against an anchor at 10
+        return pd.DataFrame({"demand_class": ["Smooth", "Lumpy"], "cost_eur": [smooth, lumpy],
+                             "anchor_cost_eur": [10.0, 10.0], "units": [10.0, 10.0], "anchor_units": [10.0, 10.0]})
+
+    good = rl.challenger_report({42: eps(11.0, 8.0), 43: eps(12.0, 8.5)}, PolicyRules())
+    assert good["gate"] == ("Lumpy",) and good["passed"]  # RL only on Lumpy: −8.75% on average
+    flat = rl.challenger_report({42: eps(10.0, 10.0), 43: eps(10.0, 10.0)}, PolicyRules())
+    assert not flat["passed"] and flat["gate"] == ()
+
+
+class _Echo(mlflow.pyfunc.PythonModel):
+    def predict(self, context, model_input, params=None):
+        return model_input
+
+
+def test_a_promoted_policy_restarts_the_anchor_shadow_from_the_live_state(tmp_path):
+    config = load_config()
+    config["_project_root"] = str(tmp_path)
+    ops = OpsConfig.model_validate({"envs": {"t": {"kind": "sim", "start": "2023-01-02", "end": "2023-06-26"}}})
+    c = steps.Cycle(config, ops, "t", pd.Timestamp("2023-04-03"))
+    live = pd.DataFrame({"store": [1, 2], "product": [7, 7], "on_hand": [3.0, 0.0], "transit_1": [1.0, 2.0],
+                         "transit_2": [0.0, 4.0], "order": [0.0, 0.0]})
+    c.write("state_live.parquet", live)
+    c.write("state_anchor.parquet", live.assign(on_hand=[9.0, 9.0]))  # left by an earlier RL policy's shadow
+    with mlflow.start_run():
+        info = mlflow.pyfunc.log_model(name="m", python_model=_Echo())
+    version = str(registry.register(info.model_uri, c.policy_name, {"kind": "ppo"}).version)
+
+    steps.promote_policy(c, version)
+    champion = registry.resolve(c.policy_name, registry.CHAMPION)
+    assert str(champion.version) == version and champion.tags["promoted_as_of"] == "2023-04-03"
+    pd.testing.assert_frame_equal(c.read("state_anchor.parquet"), live)

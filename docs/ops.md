@@ -15,8 +15,8 @@ python -m src.ops.cli drops release --env live --week 3    # live: publish VN2 f
 
 ## Environments
 
-An environment has its own registered models (`<env>-vn2-forecaster`), its own MLflow experiment
-(`vn2-ops-<env>`) and its own local state (`ops/<env>/`).
+An environment has its own registered models (`<env>-vn2-forecaster`, `<env>-vn2-policy`), its own MLflow
+experiment (`vn2-ops-<env>`) and its own local state (`ops/<env>/`).
 
 - `sim` environments replay history from weekly snapshots cut from the Week0 files, so they never contain the
   VN2 test weeks.
@@ -31,23 +31,29 @@ Each environment's rules are the shared `rules` with its overrides applied. `dev
 |---|---|
 | `ingest` | Checks the drop against the data contract (`src/ops/contract.py`): consecutive Mondays, the SKU set equal to the master, non-negative integer sales, the previous drop plus exactly one week, no restated history. It opens the cycle run and logs the drop as an input dataset. A failed contract stops the cycle, and the next week waits. |
 | `score` | Realises week D on every trajectory with the order chosen in cycle D−1 (`vn2.step_one_week` semantics). In the first week it sets the start state instead. |
-| `monitor` | Computes per-class bias and coverage of the current champion, the cost share per class, probation evidence and input diagnostics (`src/ops/monitor.py`). |
-| `decide` | A pure rule table (`src/ops/decide.py`) returns bootstrap / rollback / refit / keep. |
+| `monitor` | Computes per-class bias and coverage of the current champion, the cost share per class, probation evidence and input diagnostics (`src/ops/monitor.py`). For the policy: whether the ledger is long enough to train RL, an RL policy's cost against its anchor shadow, and gate churn. |
+| `decide` | Two pure rule tables (`src/ops/decide.py`): bootstrap / rollback / refit / keep for the forecaster, and bootstrap / fallback / retrain / keep for the policy. |
 | `refit` | Bootstrap or refit with the champion's recipe: logs a LoggedModel, registers it, runs sanity checks, then promotes. Or it rolls back. |
 | `forecast` | Forecasts decision week D+1 from `@champion`, and from `@previous` while the new champion is on probation. |
-| `order` | Computes the anchor's order for D+1 on every trajectory; `orders.csv` holds the live ones. |
+| `retrain` | The policy layer. It registers the anchor as policy version 1 (bootstrap), moves `@champion` back to the anchor (fallback), or trains a PPO challenger on the forecast ledger, checks it, registers it and promotes it if it passes. Training imports torch, so this step runs in its own process. |
+| `order` | Orders for D+1 from `<env>-vn2-policy@champion` on `live` (and on `previous`), and from the anchor on the `anchor` shadow. `orders.csv` holds the live orders with their parts: `anchor_order`, `adjustment` and `rl` (whether the learned policy decided). |
 | `report` | Logs metrics, tags and the cycle's files to the cycle run and to the timeline run (by week index), then closes the run. |
 
 Timing follows the simulator. The order chosen in cycle D is placed at the start of week D+1 and arrives at
-D+3. A forecaster promoted in cycle P therefore changes realised costs only from week P+3, so probation counts
-its € evidence from then on. Forecast-level monitors see the new model from week P+1.
+D+3. A forecaster or policy promoted in cycle P therefore changes realised costs only from week P+3, so
+probation and the fallback check count their € evidence from then on. Forecast-level monitors see a new
+forecaster from week P+1.
 
 **Trajectories.** Demand is exogenous and unmet demand is lost, so every policy's stock can be simulated exactly
-on the same weekly sales. `live` is the system. While a new champion is on probation, `previous` runs the old
-forecaster from the state at promotion: an exact counterfactual, with no off-policy estimate needed.
-Out-of-stock weeks are flagged `censored` and left out of error monitors and probation.
+on the same weekly sales. `live` is the system. While a new forecaster is on probation, `previous` runs the old
+forecaster (under the same policy) from the state at promotion. While an RL policy serves, `anchor` runs the
+anchor on the champion forecaster's forecasts from the state at the policy's promotion. Both are exact
+counterfactuals, with no off-policy estimate needed. Out-of-stock weeks are flagged `censored` and left out of
+error monitors and probation.
 
 ## Decisions (first values; calibrated on the shadow replay, then frozen)
+
+**Forecaster**
 
 | Priority | Situation | Action |
 |---|---|---|
@@ -62,12 +68,60 @@ total more than `max_total_change_pct` away from the champion's. Version tags re
 `trigger`, `as_of`, `recipe_key`, `data_digest`, `validation_status`, `promoted_as_of`, and `rejected_reason`
 for rejected versions.
 
+**Policy** (`rules.policy`)
+
+| Priority | Situation | Action |
+|---|---|---|
+| 1 | No policy registered | **bootstrap**: the anchor becomes version 1, so a fallback is always one alias move away |
+| 2 | An RL policy serves and costs more than its anchor shadow by more than `fallback_margin_pct` over the latest `evidence_weeks`, CI above 0, at least `min_evidence_weeks` | **fallback** to the anchor; the RL version is tagged `rejected` |
+| 3 | `enabled: false`, or the ledger doesn't cover 4 burn-in + `train_weeks` + `val_weeks` weeks yet | **keep** |
+| 4 | No RL challenger yet, or the last one `retrain_every_weeks` ago (rejected ones count), or more than `gate_churn_limit` of the SKUs crossed the serving policy's gate since it was trained | **retrain** |
+| 5 | Otherwise | **keep** |
+
+The fallback check runs every week while an RL policy serves, not only during a probation window. Both
+trajectories read the same champion forecaster, so a forecaster refit doesn't break the pairing.
+
+## The RL challenger (`src/ops/rl.py`)
+
+- **Data: the forecast ledger.** The challenger trains on the forecasts each week's champion really issued,
+  so it learns from the errors it will face in service. Training windows start in the `train_weeks` that end
+  `val_weeks` before the as-of week. The last `val_weeks` are the single validation check.
+  - The data goes through the same `RunData` → `block_episodes` path as research (`src/rl/data.py`).
+  - Forecaster versions play the research pipeline's block fits when training forecasts are debiased
+    (`training_forecasts: unbiased_by_class`).
+  - Demand scales come from history up to the end of training.
+- **Recipe: steady state.** The state is the research state without `round_frac` and `forecast_error`. Both are
+  VN2-window constructs: the order round doesn't exist week to week, and the error since the window started
+  is 0 in every training window's first week, but real at serving.
+  - `recipe_key` is the spec hash with one forecast source per environment (`ledger:<env>`), so every retrain
+    of the recipe shares it.
+  - The hyperparameters are the research champion's: σ 0.30 at the start, early stopping on the training
+    sample, a 2,000-iteration budget.
+- **Seeds.** Each seed trains in its own child run of the cycle (`stage=rl-train`). The project seed's final
+  weights are served. The other seeds are the robustness check; weights are never picked by validation score.
+- **Promotion check** on the validation weeks, all of:
+  - the demand-class gate is picked there, as in research, and isn't empty;
+  - the mean gated cost is ≤ the anchor's − `promote_margin_pct`;
+  - units are within ±`units_band_pct` of the anchor's in every seed;
+  - at least `min_seed_share` of the seeds beat the anchor.
+
+  The gate is optimistic on the weeks that picked it. That's why a promoted policy is then watched live
+  against the anchor's shadow (the fallback rule).
+- **Registration.** Every challenger is registered, passed or not. Its tags are `kind=ppo`, `trigger`,
+  `as_of`, `recipe_key`, `gate`, `val_vs_anchor_pct`, `seeds_beating_anchor`, `validated_with_forecaster`,
+  `training_runs` and `validation_status`, plus `rejected_reason` when it failed.
+- **Serving without torch.** The policy pyfunc (`src/serving/policy_model.py`) holds the actor as numpy
+  weights and computes the observation and the order with the training environment's functions
+  (`src/rl/observation.py`). So the order step shares a process with any forecaster.
+  - `tests/test_serving_policy.py` checks that the served orders equal the training environment's:
+    the anchor on all 599 SKUs, and PPO on 60 states including the gate.
+
 ## Where things are
 
 - **Local state:**
   - `ops/<env>/drops/`: the weekly snapshots;
   - `ops/<env>/cycles/<D>/`:
-    - `contract.json`, `signals.json`, `decision.json`;
+    - `contract.json`, `signals.json`, `decision.json` (with the policy's decision under `policy`);
     - `state_<trajectory>.parquet`, `costs_<trajectory>.parquet`, `forecasts_<alias>.parquet`;
     - `orders.csv`;
     - `done`.
@@ -75,10 +129,13 @@ for rejected versions.
   Every cycle folder is also logged to its MLflow cycle run (`cycle/`).
 - **MLflow:**
   - an `<env>-timeline` run whose metrics are indexed by week (cost per trajectory, bias, coverage, age,
-    diagnostics);
+    diagnostics, the share of SKUs RL decides);
   - a `cycle-<D>` run per week (child of the timeline);
-  - `bootstrap-<D>` / `refit-<D>` runs (children of their cycle) with the training data as an input and the
-    model.
+  - children of their cycle:
+    - `bootstrap-<D>` / `refit-<D>` runs, with the training data as an input and the forecaster;
+    - `policy-bootstrap-<D>` (the anchor policy);
+    - for a retrain, one `rl-train` run per seed and a `policy-<D>` run with the validation metrics and the
+      policy model.
 - **Models:** downloaded versions are cached under `artifacts/cache/models/<model_id>/`.
 
 ## First dev run (2023-10-02 → 2023-12-11, 11 weeks, 2 min)
@@ -90,3 +147,19 @@ for rejected versions.
 - **Calibration notes for Phase 6:**
   - a bias alarm needs at least warm-up + persistence = 6 weeks after a promotion;
   - two evidence weeks give a CI about ±2.4 points wide, much wider than the 1% rollback margin.
+
+## First real-size RL retrain (2026-11-03, isolated store)
+
+The environment ran 2022-10-03 → 2023-07-03 with a cheap CatBoost recipe refit every 13 weeks and the policy
+rules of `configs/ops.yaml`.
+
+- **When:** the ledger first covered 4 burn-in + 26 training + 8 validation weeks on 2023-06-26, 37 weeks
+  after the first forecast week, and the first challenger trained then.
+- **Cost:** 3 seeds of 146–178 s each, and 531 s for the whole cycle (budget: 20 min). The other 38 cycles took
+  about 9 s each.
+- **Outcome:** the gate was Smooth only. The mean validation cost was −0.83% vs the anchor (seeds +0.23,
+  −2.13 and −0.60%), with units within ±2%.
+  - It was rejected only because 2 of 3 seeds (0.667) fell short of `min_seed_share: 0.67`. That was a
+    rounding bug, now fixed.
+  - Under the fixed rule it would have been promoted, and the fallback check would have watched it from
+    there.

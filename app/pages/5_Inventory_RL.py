@@ -268,7 +268,7 @@ def _policy(rl_run_id: str):
 @st.cache_resource(show_spinner="Loading the forecasting run…", max_entries=2)
 def _run_data(forecast_run_id: str):
     """Forecasts, panel and test windows, shared by every configuration of one forecasting run."""
-    from src.rl.train import block_episodes, load_run_data
+    from src.rl.data import block_episodes, load_run_data
 
     data = load_run_data(cfg, forecast_run_id)
     return data, block_episodes(cfg, data, "rl_test")
@@ -281,7 +281,7 @@ def _load(rl_run_id: str):
 
 def _first_round(rl_run_id: str, key):
     """The environment and observation at the first order round of ``key``'s test window."""
-    from src.simulation.vn2_env import VN2Env
+    from src.rl.vn2_env import VN2Env
 
     spec, _, data, episodes = _load(rl_run_id)
     env = VN2Env(spec, episodes[key], data.lookup, data.scales.get(key[:2], 1.0), data.rules)

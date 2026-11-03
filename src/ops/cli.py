@@ -25,6 +25,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Weekly ops loop (drops, steps, runs)")
     parser.add_argument("--config", default="configs/config.yaml")
     parser.add_argument("--ops-config", default="configs/ops.yaml")
+    parser.add_argument("--project-root", help="where ops/ state and the artifact cache live (default: the repo)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     d = sub.add_parser("drops", help="publish weekly data drops")
@@ -47,6 +48,8 @@ def main(argv: list[str] | None = None) -> None:
 
     args = parser.parse_args(argv)
     config, ops = load_config(args.config), load_ops_config(args.ops_config)
+    if args.project_root:
+        config["_project_root"] = args.project_root
     if args.command == "drops":
         if args.action == "release":
             print(drops.release(config, args.env, args.week))

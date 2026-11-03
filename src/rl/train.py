@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import dataclass, replace
+from dataclasses import replace
 
 import matplotlib
 
@@ -25,102 +25,12 @@ import mlflow
 import numpy as np
 import pandas as pd
 
-from src.forecasting.measures import Measure, run_measures
-from src.forecasting.periods import fetch_run_file, load_run_setup
-from src.forecasting.preprocessing import load_initial_state, load_panel_from_config
 from src.rl.agents import model_file
+from src.rl.data import RunData, block_episodes, load_run_data
 from src.rl.rollout import anchor_baseline, per_class_delta, per_class_units, rollout, units_vs_anchor
 from src.rl.spec import PolicySpec, validate_spec
-from src.rl.vn2_data import _PANEL_COLS, build_forecast_lookup, build_vn2_episodes, compute_demand_scales
-from src.simulation.anchor import AnchorSpec, resolve_anchor
-from src.simulation.vn2 import VN2Rules
 from src.utils import tracking
 from src.utils.config import load_config
-
-# ---------------------------------------------------------------------------
-# Forecasting-run data
-# ---------------------------------------------------------------------------
-
-@dataclass
-class RunData:
-    """Everything RL needs from one forecasting run."""
-
-    run_id: str | None
-    setup: dict
-    measures: list[Measure]
-    lookup: dict
-    panel: pd.DataFrame
-    scales: dict[tuple[int, int], float]
-    default_anchor: AnchorSpec
-    anchor_warnings: list[str]
-    rules: VN2Rules
-
-    @property
-    def measure_ids(self) -> list[str]:
-        return [m.id for m in self.measures]
-
-
-def official_window_start(config: dict) -> pd.Timestamp | None:
-    """First week of the official VN2 window (week after the initial-state date)."""
-    init_date = config.get("data", {}).get("initial_state_date")
-    return pd.Timestamp(init_date) + pd.Timedelta(weeks=1) if init_date else None
-
-
-def load_run_data(config: dict, run_id: str | None) -> RunData:
-    """Forecasts, measures, panel and demand scales of a forecasting run (None → latest)."""
-    setup = load_run_setup(config, run_id)
-    path = fetch_run_file(config, run_id, "train_forecasts.parquet")
-    if setup is None or path is None:
-        which = f"forecasting run {run_id}" if run_id else "the latest forecasting run on disk"
-        raise RuntimeError(
-            f"No period setup or forecasts found for {which}. "
-            "Run the forecasting pipeline from the app or CLI first."
-        )
-    rules = VN2Rules.from_config(config)
-    measures = run_measures(config, run_id)
-    anchor, warnings = resolve_anchor(measures, rules)
-    if anchor is None:
-        raise RuntimeError("; ".join(warnings))
-    resolved = setup["resolved"]
-    panel = load_panel_from_config(
-        config, start=pd.Timestamp(resolved["data_start"]), end=pd.Timestamp(resolved["data_end"])
-    )
-    if "in_stock" not in panel.columns:
-        panel["in_stock"] = True
-    forecasts = pd.read_parquet(path)
-    return RunData(
-        run_id=setup.get("run_id") or run_id,
-        setup=setup,
-        measures=measures,
-        lookup=build_forecast_lookup(forecasts, [m.id for m in measures]),
-        panel=panel,
-        # Scales come from history up to the end of RL training only (no peeking).
-        scales=compute_demand_scales(panel[_PANEL_COLS], cap_end=pd.Timestamp(resolved["rl_train_end"])),
-        default_anchor=anchor,
-        anchor_warnings=warnings,
-        rules=rules,
-    )
-
-
-def block_episodes(config: dict, data: RunData, block: str) -> dict:
-    """VN2 episodes of ``rl_train``, ``rl_val`` or ``rl_test`` for a forecasting run."""
-    resolved = data.setup["resolved"]
-    start, end = pd.Timestamp(resolved[f"{block}_start"]), pd.Timestamp(resolved[f"{block}_end"])
-    official_start = official_window_start(config)
-    initial_state = None
-    if official_start is not None and block == "rl_test" and start <= official_start <= end:
-        initial_state = load_initial_state(config["data"]["initial_state_file"])
-    return build_vn2_episodes(
-        data.panel,
-        start,
-        end,
-        data.lookup,
-        config,
-        data.default_anchor,
-        initial_state=initial_state,
-        official_window_start=official_start,
-    )
-
 
 # ---------------------------------------------------------------------------
 # In-sample learning curve (display only: weights are never picked from it)
@@ -238,8 +148,16 @@ def train_agent(
     data: RunData | None = None,
     train_eps: dict | None = None,
     val_eps: dict | None = None,
+    experiment_id: str | None = None,
+    parent_run_id: str | None = None,
+    tags: dict | None = None,
 ) -> dict:
-    """Train one seed of ``spec`` on ``rl_train``, validate once on ``rl_val``, save artifacts."""
+    """
+    Train one seed of ``spec`` on ``rl_train``, validate once on ``rl_val``, save artifacts.
+
+    By default the run goes to the RL experiment; the ops loop passes its own experiment, its
+    cycle run as the parent and extra tags.
+    """
     data = data or load_run_data(config, spec.forecast_run_id)
     errors = validate_spec(spec, data.measure_ids)
     if errors:
@@ -257,10 +175,14 @@ def train_agent(
             data, config, by_class=spec.training_forecasts == "unbiased_by_class"
         )
 
-    tracking.setup_mlflow(config, "rl")
+    if experiment_id is None:
+        tracking.setup_mlflow(config, "rl")
+    else:
+        tracking.init_tracking(config)
     resolved = data.setup["resolved"]
 
-    with mlflow.start_run(run_name=f"{spec.method}_{spec.agent}_s{spec.seed}") as run:
+    with mlflow.start_run(run_name=f"{spec.method}_{spec.agent}_s{spec.seed}", experiment_id=experiment_id,
+                          parent_run_id=parent_run_id) as run:
         mlflow.set_tags({
             "stage": "train",
             "forecast_run_id": spec.forecast_run_id,
@@ -269,6 +191,7 @@ def train_agent(
             "method": spec.method,
             "agent": spec.agent,
             "role": "deploy" if spec.seed == project_seed else "seed_check",
+            **(tags or {}),
         })
         tracking.log_provenance(config)
         params = {

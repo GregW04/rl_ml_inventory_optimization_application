@@ -27,8 +27,8 @@ Keep them in separate processes: LightGBM and torch segfault in one process on m
 ```
 configs/config.yaml      # single source of truth
 src/forecasting/         # preprocessing, features, validation, model, pipeline
-src/simulation/          # VN2 replay engine, lost-sales anchor, RL environment
-src/rl/                  # policy spec, batched replay, PPO / GRPO training, selection, test scoring
+src/simulation/          # VN2 replay engine, lost-sales anchor
+src/rl/                  # policy spec, environment and its batched twin, PPO / GRPO training, selection, test scoring
 src/serving/             # forecaster (and later the policy) as MLflow pyfunc models
 src/ops/                 # weekly production loop: drops, data contract, ledgers, monitors, decisions, registry
 src/utils/               # metrics, config, and tracking.py (MLflow setup, provenance, artifact cache)

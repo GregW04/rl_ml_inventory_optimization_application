@@ -60,9 +60,8 @@ Every forecasting, RL training and test run (`tracking.log_provenance`) records:
 
 ## Model Registry and serving
 
-The production loop (in progress, see the MLOps plan) keeps two registered models per environment
-(`src/ops/registry.py`), `<env>-vn2-forecaster` and `<env>-vn2-policy`, with `env` = `live` or `sim-<name>`.
-Three aliases have fixed meanings:
+The production loop ([ops.md](ops.md)) keeps two registered models per environment
+(`src/ops/registry.py`), `<env>-vn2-forecaster` and `<env>-vn2-policy`. Three aliases have fixed meanings:
 
 - `champion` serves. Consumers resolve `models:/<name>@champion` at runtime, so moving the alias *is* the
   deployment.
@@ -90,6 +89,32 @@ Model version tags hold the audit trail (trigger, recipe key, data digest, valid
 ```python
 model = mlflow.pyfunc.load_model("models:/live-vn2-forecaster@champion")  # in a torch-free process
 forecasts = model.predict(history, params={"as_of": "2024-04-01"})
+```
+
+**The policy as an MLflow model** (`src/serving/policy.py`, `log_policy`):
+
+- **Logged from code**: `python_model=src/serving/policy_model.py`, with `src/` as `code_paths`.
+- **Two kinds:**
+  - `anchor`: the lost-sales anchor. Version 1 of every policy model, the fallback.
+  - `ppo`: a PPO actor plus an optional gate of demand classes it acts on; the anchor orders for the rest.
+- **Artifacts:**
+  - `policy.json`: kind, VN2 rules, anchor spec, gate, and for PPO the policy spec;
+  - for PPO, `actor.npz` (the actor's weights as numpy arrays) and `scales.csv` (the demand scale per SKU).
+- **No torch at serving.** The actor runs in numpy, and the observation and order come from the same
+  functions the training environment uses (`src/rl/observation.py`). The pip requirements are mlflow,
+  pandas, numpy and PyYAML.
+- **Contract.** The input has one row per SKU for the decision week:
+  - `store`, `product`;
+  - stock: `on_hand`, `transit_1` (arrives this week), `transit_2` (arrives next week);
+  - the decision week's forecasts;
+  - context: `zero_share`, `pos_cv`, `dp_sbc_class`.
+
+  The output is `order`, `anchor_order`, `adjustment` (order − anchor) and `rl` (whether the learned policy
+  decided). Missing forecasts raise instead of ordering 0.
+
+```python
+policy = mlflow.pyfunc.load_model("models:/live-vn2-policy@champion")
+orders = policy.predict(decision_frame)   # src.ops.rl.decision_frame(state, forecasts, context)
 ```
 
 **Recipe and refit** (`src/forecasting/recipe.py`):
@@ -171,6 +196,30 @@ forecasts = model.predict(history, params={"as_of": "2024-04-01"})
     - the provenance tags.
   - **Metrics:** `test_cost_eur_per_sku`, `test_anchor_cost_eur_per_sku`, `test_minus_anchor_eur` with `test_delta_ci_lo` / `test_delta_ci_hi`, `test_minus_anchor_pct_{class}`, `test_units_vs_anchor_pct`, `test_vn2_score_eur` / `test_anchor_vn2_score_eur` (official window), and the champion's `val_mean`.
   - **Artifacts:** `test/test_episodes.parquet` and `test/test_vs_anchor.png`.
+
+### `vn2-ops-<env>` (the weekly loop, [ops.md](ops.md))
+
+- **`<env>-timeline`** (`stage=timeline`): the container of the environment's cycles. Its metrics are the
+  cycles' metrics with step = week index, so the MLflow chart view shows them as time series.
+- **`cycle-<D>`** (`stage=cycle`, child of the timeline), one per week:
+  - **Tags:**
+    - `as_of`, `env`, `rules_version` (hash of the effective rules), `strategy`;
+    - the decisions: `decision`, `decision_reasons`, `policy_decision`, `policy_reasons`;
+    - what served: `champion_version`, `previous_version`, `policy_version`, `policy_kind`;
+    - the provenance tags.
+  - **Metrics:**
+    - per trajectory: `<trajectory>_{cost,holding,shortage}_eur_per_sku` and `<trajectory>_censored_share`;
+    - `live_units_ordered`, `rl_share_of_skus` and `champion_age_weeks`;
+    - the monitors: `bias_ts_<class>`, `coverage_q83_<class>`, `probation_delta_pct` and `diag_*`.
+  - **Input:** the week's drop (context `weekly_drop`).
+  - **Artifacts:** `cycle/`, a copy of the cycle folder.
+- **Children of a cycle run:**
+  - `bootstrap-<D>` / `refit-<D>`: the training data (input, context `training`) and the forecaster;
+  - `policy-bootstrap-<D>`: the anchor policy;
+  - on a retrain, one `rl-train` run per seed and a `policy-<D>` run:
+    - the `rl-train` runs follow the training-run layout above, with `forecast_run_id=ledger:<env>`;
+    - `policy-<D>` logs `val_vs_anchor_pct` (also per seed, `val_vs_anchor_pct_s<seed>`),
+      `seeds_beating_anchor` and the policy model.
 
 ## Duplicate-run guard
 

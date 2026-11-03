@@ -122,7 +122,7 @@ def debiased_lookup(lookup: dict, rows: pd.DataFrame, factors: pd.DataFrame) -> 
 
 
 def training_lookup(data, config: dict, by_class: bool) -> tuple[dict, pd.DataFrame]:
-    """(corrected forecast lookup for training, factor table) for a :class:`src.rl.train.RunData`."""
+    """(corrected forecast lookup for training, factor table) for a :class:`src.rl.data.RunData`."""
     if not _level_measures(data.measures):
         raise ValueError("Unbiased training forecasts need a mean forecast at h0 or h1.")
     classes = None
