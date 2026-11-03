@@ -362,3 +362,43 @@ were made, and each model was stored twice: in `mlartifacts/` and in the downloa
   5.4 s).
 - While the disk was full, Airflow's scheduler died: standalone couldn't write its log. `make airflow-stop` and
   `make airflow` restarted it; the queued runs resumed, after clearing the tasks that had failed.
+
+## The ops test: the live VN2 run (Phase 7, 2026-11-03)
+
+**Setup.** Run once, under the frozen rules (tag `ops-rules-v1`, rules `03f2617e8ceb`), from a clean tree, as the
+`vn2_live` DAG.
+
+- **Data.** The nine organizer files were released one at a time, each after the previous week had finished.
+  Checked beforehand: each file only appends one week to an unchanged history.
+- **Start.** `cli carry-over --from sim-final --to live`:
+  - the forecaster fit on 2024-02-05;
+  - RL policy v5, gated on Intermittent + Lumpy;
+  - the anchor as the fallback, and as the exact shadow from the official initial state.
+
+**What happened.** 9 cycles, 24 min.
+
+- RL decided the round-1 orders of 455 of the 599 SKUs.
+- The age refit on 2024-05-06 was promoted. Its probation evidence was −0.43% against the old forecaster
+  (CI −2.03 … +1.07), so it was kept.
+- The RL fallback check at the end: −1.28% against the anchor's shadow (CI −1.99 … −0.59), so RL kept serving.
+
+**Score** (`cli score --env live`, run `19e79a67`, scored once):
+
+| official window, weeks 3–8, 599 SKUs | € | € / SKU-window |
+|---|---|---|
+| live: RL v5 and the refit forecaster | **3654.2** | **6.101** |
+| the anchor's shadow on the same forecasts | 3698.0 | 6.174 |
+| live vs anchor (paired, CI over SKUs) | **−1.18%** (−1.77 … −0.62) | |
+| research's locked test (run `b9950526`): RL vs anchor | 3582.8 vs 3618.2 (−0.98%) | 5.981 vs 6.040 |
+
+- **By class:** Intermittent −2.85% and Lumpy −2.27% (the gate), Smooth +0.10% and Erratic −0.07%. Units were
+  −1.07% against the anchor's.
+- **RL's gain over the anchor holds on the real weeks,** at a similar size to research: −1.18% against −0.98%.
+  Here it comes from a system that trained, validated, promoted and monitored the policy itself on data before
+  the window, and served it without torch.
+- **Both ops numbers are about 2% above research's** (the anchor: 3698.0 against 3618.2). The ops forecaster was
+  tuned only on the 76 weeks up to 2022-09-19, while research's 74602b75 was tuned with CV data up to
+  2023-07-31. That gap is the price of an honest go-live.
+- **Disclosure.** Research's test lock had already scored these weeks once (run `b9950526`). The ops rules were
+  set on the shadow replay (up to 2024-04-01), then frozen and tagged before the live run. Nothing was changed
+  after it.
