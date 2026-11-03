@@ -23,6 +23,7 @@ dependencies = [
     "optuna~=4.8.0",
     "gymnasium~=1.2.3",
     "pydantic~=2.13.4",  # configs/ops.yaml validation
+    "statsmodels~=0.15.0",  # the ops loop's seasonal-trend diagnostic (MSTL)
 ]
 
 [project.optional-dependencies]

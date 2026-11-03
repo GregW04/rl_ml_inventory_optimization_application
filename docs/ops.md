@@ -332,6 +332,9 @@ identical demand, so their costs pair on the same in-stock SKU-weeks. The CI is 
   Lumpy −0.87, the start of the decline). But refitting on them didn't beat a steady 13-week rhythm.
 - **What stays on.** The monitors keep running as logged signals (`bias_ts_*` and `coverage_q83_*` on the
   timeline run); only the trigger is age.
+- **What was deleted.** After the comparison, the model files and registered models of `sim-never`, `sim-drift`
+  and `sim-drift-backstop` were removed (24 models, 7.05 GB). Their runs, metrics and ledgers remain, and the
+  models refit bit for bit from the recipe and the drops. `sim-fixed13` and `sim-final` keep theirs.
 
 **The final replay** (`sim-final`: the chosen rules with RL on, run as the Airflow DAG `vn2_sim-final`, 79 weeks):
 
@@ -402,3 +405,16 @@ were made, and each model was stored twice: in `mlartifacts/` and in the downloa
 - **Disclosure.** Research's test lock had already scored these weeks once (run `b9950526`). The ops rules were
   set on the shadow replay (up to 2024-04-01), then frozen and tagged before the live run. Nothing was changed
   after it.
+
+**Seasonally adjusted level diagnostic** (`diag_level_change_13w_pct_<class>`, logged only, never a trigger).
+For each class, the weekly sales of its current SKUs, minus the seasonal component of an MSTL decomposition
+(yearly period, robust), as the mean of the last 4 weeks against the 4 weeks ending 13 weeks earlier.
+
+- **It needs two full years** of history, so it starts in 2023-08.
+- **Why not the decomposition's trend:** it is smoothed over more than a year. On synthetic data it showed a
+  +30% shift from 10 weeks ago as +0.9%.
+- **Read it qualitatively.** With only 2–3 yearly cycles, the seasonal estimate is weak around holidays. On
+  2024-02-26 it gives Intermittent +44%, which is implausible.
+- **Moving holidays distort year-on-year numbers too.** Easter fell on 9 April in 2023 and on 31 March in 2024,
+  so part of the "−23.5% against last year by the end of March 2024" in the planning evidence is the holiday
+  moving, not demand.

@@ -515,3 +515,20 @@ def test_the_ops_test_is_scored_once(tmp_path):
         pass
     with pytest.raises(score.LockedTestError, match="already scored"):
         score.score_live(config, ops, "live")
+
+
+def test_the_trend_diagnostic_sees_a_level_shift_through_the_season():
+    weeks_ = pd.date_range("2021-04-12", periods=160, freq="7D")
+    season = 1 + 0.4 * np.sin(2 * np.pi * np.arange(160) / 52)
+
+    def panel(shift_from=None):
+        level = np.where(np.arange(160) >= shift_from, 1.3, 1.0) if shift_from else np.ones(160)
+        return pd.DataFrame([(s, 1, w, 20 * season[i] * level[i]) for s in range(3) for i, w in enumerate(weeks_)],
+                            columns=["store", "product", "date", "sales"])
+
+    classes = pd.DataFrame({"store": range(3), "product": 1, "date": weeks_[-1], "demand_class": "Smooth"})
+    flat = monitor.trend_changes(panel(), classes, weeks_[-1])["level_change_13w_pct_smooth"]
+    shifted = monitor.trend_changes(panel(shift_from=150), classes, weeks_[-1])["level_change_13w_pct_smooth"]
+    assert abs(flat) < 2.0 and 20.0 < shifted < 40.0  # the season alone moves nothing; a +30% level shows
+    young = panel()[lambda df: df["date"] <= weeks_[100]]  # under two years of history: nothing
+    assert monitor.trend_changes(young, classes.assign(date=weeks_[100]), weeks_[100]) == {}

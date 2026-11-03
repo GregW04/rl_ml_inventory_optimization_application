@@ -13,8 +13,9 @@ the shadow running the previous forecaster, on the weeks where the two can diffe
 weeks after promotion: orders take two weeks to arrive), with a bootstrap CI over SKUs.
 
 Diagnostics, logged and never a trigger: out-of-stock share, zero-sales share and sales level
-against the same weeks last year, a seasonally matched PSI, and demand-class churn since the
-champion's fit. Out-of-stock (censored) SKU-weeks are left out of every error and coverage.
+against the same weeks last year, a seasonally matched PSI, demand-class churn since the
+champion's fit, and each class's seasonally adjusted 13-week level change (MSTL). Out-of-stock
+(censored) SKU-weeks are left out of every error and coverage.
 """
 
 from __future__ import annotations
@@ -28,6 +29,8 @@ from src.ops.ledger import KEYS
 from src.ops.settings import Rules
 
 LEAD_WEEKS = 2  # an order placed at the start of week k arrives at the start of week k+2
+YEAR_WEEKS = 52
+TREND_WEEKS = 13
 COST_SHARE_WEEKS = 13
 PSI_EDGES = [-0.5, 0.5, 1.5, 2.5, 4.5, 8.5, 16.5, 32.5, np.inf]
 WEEK = pd.Timedelta(weeks=1)
@@ -187,4 +190,29 @@ def diagnostics(panel: pd.DataFrame, classes: pd.DataFrame, as_of: pd.Timestamp,
         b = classes[classes["date"] == fit_as_of].set_index(KEYS)["demand_class"]
         both = a.to_frame("now").join(b.rename("fit"), how="inner")
         out["class_churn_since_fit"] = float((both["now"] != both["fit"]).mean()) if len(both) else 0.0
+    out.update(trend_changes(panel, classes, as_of))
+    return out
+
+
+def trend_changes(panel: pd.DataFrame, classes: pd.DataFrame, as_of: pd.Timestamp, weeks: int = TREND_WEEKS) -> dict:
+    """
+    Per class, how much the seasonally adjusted sales level moved over the last ``weeks`` (%): the
+    weekly sales of the SKUs in the class now, minus the seasonal component of an MSTL
+    decomposition (yearly period, robust), averaged over 4 weeks, now against ``weeks`` earlier.
+    A model-free view of level shifts next to the forecast-bias monitor; it needs two full years.
+    (The decomposition's own trend is smoothed over more than a year and lags a recent shift.)
+    """
+    from statsmodels.tsa.seasonal import MSTL  # only here: keeps every other step's start-up light
+
+    current = classes[classes["date"] == as_of][[*KEYS, "demand_class"]]
+    hist = panel[panel["date"] <= as_of][[*KEYS, "date", "sales"]].merge(current, on=KEYS)
+    out = {}
+    for cls, g in hist.groupby("demand_class"):
+        series = g.groupby("date")["sales"].sum().sort_index().to_numpy()
+        if len(series) < 2 * YEAR_WEEKS + weeks + 4:
+            continue
+        adjusted = series - MSTL(series, periods=YEAR_WEEKS, stl_kwargs={"robust": True}).fit().seasonal
+        now, then = adjusted[-4:].mean(), adjusted[-weeks - 4:-weeks].mean()
+        if then > 0:
+            out[f"level_change_{weeks}w_pct_{str(cls).lower()}"] = float(100.0 * (now / then - 1.0))
     return out
