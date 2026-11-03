@@ -121,24 +121,27 @@ def _git(*args: str) -> str:
     return out.stdout if out.returncode == 0 else ""
 
 
-def log_provenance(config: dict) -> None:
+def log_provenance(config: dict, run_id: str | None = None) -> None:
     """
-    Tag the active run with the code it ran and log the effective config.
+    Tag a run (the active one by default) with the code it ran and log the effective config.
 
     MLflow records ``mlflow.source.git.commit`` by itself, but not whether the code folders had
     uncommitted changes. Tags ``git_sha`` and ``git_dirty``; for a dirty tree also logs
     ``provenance/git_status.txt`` and ``provenance/git_diff.patch`` so the run can be rebuilt.
     ``config/effective.yaml`` is the config the run actually used (including app overrides).
     """
+    client = MlflowClient()
+    run_id = run_id or mlflow.active_run().info.run_id
     sha = _git("rev-parse", "HEAD").strip()
     status = _git("status", "--porcelain", "--untracked-files=normal", "--", *CODE_PATHS)
     dirty = bool(status.strip())
-    mlflow.set_tags({"git_sha": sha, "git_dirty": str(dirty).lower()})
+    client.set_tag(run_id, "git_sha", sha)
+    client.set_tag(run_id, "git_dirty", str(dirty).lower())
     effective = {k: v for k, v in config.items() if not k.startswith("_")}
-    mlflow.log_text(yaml.safe_dump(effective, sort_keys=False), "config/effective.yaml")
+    client.log_text(run_id, yaml.safe_dump(effective, sort_keys=False), "config/effective.yaml")
     if dirty:
-        mlflow.log_text(status, "provenance/git_status.txt")
-        mlflow.log_text(_git("diff", "HEAD", "--", *CODE_PATHS), "provenance/git_diff.patch")
+        client.log_text(run_id, status, "provenance/git_status.txt")
+        client.log_text(run_id, _git("diff", "HEAD", "--", *CODE_PATHS), "provenance/git_diff.patch")
 
 
 def config_hash(section_dict: dict, ignore_keys: tuple[str, ...] = ()) -> str:

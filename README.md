@@ -30,11 +30,12 @@ src/forecasting/         # preprocessing, features, validation, model, pipeline
 src/simulation/          # VN2 replay engine, lost-sales anchor, RL environment
 src/rl/                  # policy spec, batched replay, PPO / GRPO training, selection, test scoring
 src/serving/             # forecaster (and later the policy) as MLflow pyfunc models
-src/ops/                 # production loop: Model Registry conventions (more in progress)
+src/ops/                 # weekly production loop: drops, data contract, ledgers, monitors, decisions, registry
 src/utils/               # metrics, config, and tracking.py (MLflow setup, provenance, artifact cache)
 app/                     # Streamlit frontend (Home + 5 pages)
 notebooks/               # EDA and pipeline demos
 docs/mlflow.md           # MLflow + tracking-utility guide
+docs/ops.md              # the weekly ops loop: cycle, decisions, environments
 data/                    # VN2 competition CSVs
 ```
 

@@ -22,6 +22,7 @@ dependencies = [
     "catboost~=1.2.10",
     "optuna~=4.8.0",
     "gymnasium~=1.2.3",
+    "pydantic~=2.13.4",  # configs/ops.yaml validation
 ]
 
 [project.optional-dependencies]

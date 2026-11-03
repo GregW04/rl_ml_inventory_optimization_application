@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import warnings
 from importlib.metadata import version
 from pathlib import Path
 
@@ -54,11 +55,16 @@ def log_forecaster(
     example = history.merge(skus, on=["store", "product"])[PANEL_COLUMNS]
     example = example[(example["date"] <= as_of) & (example["date"] > as_of - pd.Timedelta(weeks=EXAMPLE_WEEKS))]
     output = forecast(forecaster, panel_from_history(example, master), as_of, cfg)
-    # Default "": the latest week in the input is the as-of week.
-    signature = infer_signature(example, output, params={"as_of": ""})
+    with warnings.catch_warnings():
+        # store / product are integer ids that are never missing; MLflow's hint about integer columns
+        # with missing values doesn't apply.
+        warnings.filterwarnings("ignore", message=".*Inferred schema contains integer column")
+        # Default "": the latest week in the input is the as-of week.
+        signature = infer_signature(example, output, params={"as_of": ""})
     meta = {"recipe": recipe.to_dict(), "recipe_key": recipe.key(), "as_of": str(as_of.date()),
             "data_digest": data_digest, "config": cfg}
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory() as tmp, warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*Inferred schema contains integer column")
         tmp = Path(tmp)
         forecaster.save(tmp / "forecaster.joblib")
         master.to_csv(tmp / "master.csv", index=False)

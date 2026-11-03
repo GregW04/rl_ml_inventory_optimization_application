@@ -1,0 +1,48 @@
+# Weekly production loop (src/ops): environments, retrain/promotion rules and thresholds.
+# The thresholds are first values. The shadow replay calibrates them (Phase 6) and then sets
+# `frozen: true`; the live environment refuses rules that are not frozen.
+frozen: false
+
+rules:
+  # never | fixed (refit at max age) | drift (refit on monitor alarms) | drift_backstop (either)
+  strategy: drift_backstop
+  max_age_weeks: 13
+  # After a refit, drift alarms wait this many weeks (a severe bias alarm doesn't wait).
+  cooldown_weeks: 4
+  bias:
+    # Trigg's tracking signal per demand class on the weekly relative h0 error, restarted for
+    # each forecaster version; it counts once `warmup_weeks` errors exist.
+    alpha: 0.2
+    limit: 0.74
+    severe_limit: 0.9
+    warmup_weeks: 4
+    persistence_weeks: 2
+    # Only classes carrying at least this share of the realised cost can trigger a refit.
+    min_cost_share: 0.15
+  coverage:
+    # Share of SKU-weeks with sales <= q83_h2 over the trailing window, per demand class.
+    window_weeks: 4
+    band: [0.79, 0.88]
+    persistence_weeks: 2
+  probation:
+    # A promoted forecaster's orders change realised cost only from 3 weeks after promotion
+    # (2-week lead time), so evidence weeks are counted from then on.
+    evidence_weeks: 4
+    min_evidence_weeks: 2
+    rollback_margin_pct: 1.0
+  sanity:
+    # A refit's decision-week forecast total may differ from the champion's by at most this.
+    max_total_change_pct: 30.0
+  n_boot: 1000
+  seed: 42
+
+envs:
+  # Short development replay: a cheap recipe and a short max age, so that refits, promotion
+  # and probation all happen within a few weeks.
+  dev:
+    kind: sim
+    start: "2023-10-02"
+    end: "2023-12-11"
+    model_params: {iterations: 150, depth: 4, learning_rate: 0.1, allow_writing_files: false}
+    forecasting: {model: {name: catboost}, ensemble: {enabled: false}}
+    rules: {max_age_weeks: 4}
