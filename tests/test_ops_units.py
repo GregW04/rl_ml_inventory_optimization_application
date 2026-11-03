@@ -479,3 +479,39 @@ def test_carry_over_starts_an_environment_from_another_ones_champions(tmp_path):
     assert len(out["policy"]) == 2
     with pytest.raises(RuntimeError, match="already has versions"):
         steps.carry_over(config, ops, "src", "dst")
+
+
+# ---------------------------------------------------------------------------
+# The ops test (live score, once)
+# ---------------------------------------------------------------------------
+
+def test_the_ops_test_scores_the_competition_weeks_paired_with_the_anchor():
+    from src.ops import score
+
+    weeks_ = score.scored_weeks(load_config(), RULES)
+    assert [str(w.date()) for w in (weeks_[0], weeks_[-1])] == ["2024-04-29", "2024-06-03"] and len(weeks_) == 6
+    window = pd.date_range("2024-04-15", periods=8, freq="7D")
+    anchor = pd.DataFrame([(s, 1, w, 10.0 + s) for s in range(3) for w in window], columns=["store", "product", "week", "cost_eur"])
+    live = anchor.assign(cost_eur=np.where(anchor["week"].isin(weeks_), anchor["cost_eur"] * 0.98, 999.0))
+    classes = pd.Series(["Lumpy", "Smooth", "Lumpy"], index=pd.MultiIndex.from_tuples([(s, 1) for s in range(3)], names=["store", "product"]))
+    _, m = score.paired_score(live, anchor, weeks_, classes)
+    # Weeks 1–2 (999 €) don't count; the live run is 2% cheaper on every scored SKU-week.
+    assert m["anchor_vn2_score_eur"] == pytest.approx(6 * (10 + 11 + 12))
+    assert m["live_vs_anchor_pct"] == pytest.approx(-2.0) and m["ci_lo"] == pytest.approx(-2.0)
+    assert m["live_vs_anchor_pct_lumpy"] == pytest.approx(-2.0)
+
+
+def test_the_ops_test_is_scored_once(tmp_path):
+    from src.ops import score
+
+    config = load_config()
+    config["_project_root"] = str(tmp_path)
+    ops = OpsConfig.model_validate({"envs": {"live": {"kind": "live", "start": "2024-04-08", "end": "2024-04-15"}}})
+    for d in ("2024-04-08", "2024-04-15"):
+        c = steps.Cycle(config, ops, "live", pd.Timestamp(d))
+        c.path("done").parent.mkdir(parents=True)
+        c.path("done").write_text(d)
+    with mlflow.start_run(experiment_id=steps.experiment_id(c), tags={"ops_test": "true"}):
+        pass
+    with pytest.raises(score.LockedTestError, match="already scored"):
+        score.score_live(config, ops, "live")

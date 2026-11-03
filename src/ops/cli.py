@@ -10,6 +10,7 @@ Command line of the ops loop (what the Airflow tasks call):
     python -m src.ops.cli calibrate --env sim-never                        # drift-threshold tables
     python -m src.ops.cli compare --envs sim-never sim-fixed13 --reference sim-fixed13
     python -m src.ops.cli carry-over --from sim-final --to live            # go-live
+    python -m src.ops.cli score --env live                                 # the ops test, once
 
 The tracking store comes from ``MLFLOW_TRACKING_URI`` (``make mlflow-server``) or the config.
 """
@@ -22,7 +23,7 @@ import warnings
 import pandas as pd
 import yaml
 
-from src.ops import calibrate, drops, retune
+from src.ops import calibrate, drops, retune, score
 from src.ops.settings import dump, env_settings, load_ops_config, weeks
 from src.ops.steps import STEPS, Cycle, carry_over, run_env, run_step
 from src.ops.tune import tune_recipe
@@ -89,6 +90,10 @@ def main(argv: list[str] | None = None) -> None:
     co.add_argument("--from", dest="source", required=True)
     co.add_argument("--to", dest="target", required=True)
 
+    sc = sub.add_parser("score", help="the ops test: official VN2 score of a live environment, once")
+    sc.add_argument("--env", default="live")
+    sc.add_argument("--override-lock", action="store_true", help="score again (tagged post_hoc)")
+
     args = parser.parse_args(argv)
     config, ops = load_config(args.config), load_ops_config(args.ops_config)
     if args.project_root:
@@ -102,6 +107,8 @@ def main(argv: list[str] | None = None) -> None:
                 print(path)
     elif args.command == "step":
         run_step(Cycle(config, ops, args.env, pd.Timestamp(args.as_of)), args.name)
+    elif args.command == "score":
+        print(dump(score.score_live(config, ops, args.env, args.override_lock)))
     elif args.command == "carry-over":
         for layer, lines in carry_over(config, ops, args.source, args.target).items():
             print(layer, *lines, sep="\n  ")
