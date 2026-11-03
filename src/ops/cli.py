@@ -12,6 +12,7 @@ The tracking store comes from ``MLFLOW_TRACKING_URI`` (``make mlflow-server``) o
 from __future__ import annotations
 
 import argparse
+import warnings
 
 import pandas as pd
 
@@ -20,11 +21,19 @@ from src.ops.settings import env_settings, load_ops_config, weeks
 from src.ops.steps import STEPS, Cycle, run_env, run_step
 from src.utils.config import load_config
 
+# MLflow notes that don't apply here, kept out of every task log: the drops' integer columns never
+# hold NaN (the data contract), a local CSV source matches two identical source classes, and the
+# pyfuncs declare their schema in the signature rather than in type hints.
+QUIET = (".*Inferred schema contains integer column", ".*dataset source can be interpreted in multiple ways",
+         ".*Add type hints to the `predict` method")
+
 
 def main(argv: list[str] | None = None) -> None:
+    for message in QUIET:
+        warnings.filterwarnings("ignore", message=message)
     parser = argparse.ArgumentParser(description="Weekly ops loop (drops, steps, runs)")
-    parser.add_argument("--config", default="configs/config.yaml")
-    parser.add_argument("--ops-config", default="configs/ops.yaml")
+    parser.add_argument("--config", help="default: the repo's configs/config.yaml (from any directory)")
+    parser.add_argument("--ops-config", help="default: the repo's configs/ops.yaml")
     parser.add_argument("--project-root", help="where ops/ state and the artifact cache live (default: the repo)")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -44,7 +53,8 @@ def main(argv: list[str] | None = None) -> None:
     r.add_argument("--env", required=True)
     r.add_argument("--start")
     r.add_argument("--end")
-    r.add_argument("--force", action="store_true", help="re-run weeks that already finished")
+    r.add_argument("--force", action="store_true",
+                   help="re-run the latest finished week (earlier weeks need a fresh environment)")
 
     args = parser.parse_args(argv)
     config, ops = load_config(args.config), load_ops_config(args.ops_config)

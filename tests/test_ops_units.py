@@ -292,3 +292,24 @@ def test_a_promoted_policy_restarts_the_anchor_shadow_from_the_live_state(tmp_pa
     champion = registry.resolve(c.policy_name, registry.CHAMPION)
     assert str(champion.version) == version and champion.tags["promoted_as_of"] == "2023-04-03"
     pd.testing.assert_frame_equal(c.read("state_anchor.parquet"), live)
+
+
+def test_an_earlier_week_cannot_run_after_a_later_one(tmp_path):
+    config = load_config()
+    config["_project_root"] = str(tmp_path)
+    ops = OpsConfig.model_validate({"envs": {"t": {"kind": "sim", "start": "2023-01-02", "end": "2023-06-26"}}})
+    later = steps.Cycle(config, ops, "t", pd.Timestamp("2023-02-13"))
+    later.path("done").parent.mkdir(parents=True)
+    later.path("done").write_text("2023-02-13")
+    with pytest.raises(RuntimeError, match="has already run 2023-02-13"):
+        steps.step_ingest(steps.Cycle(config, ops, "t", pd.Timestamp("2023-02-06")))
+
+
+def test_a_week_has_one_timestamp_unit_however_it_arrives():
+    # The CLI (Airflow tasks) parses a string, the in-process loop walks a date range: same ledgers.
+    ops = OpsConfig.model_validate({"envs": {"t": {"kind": "sim", "start": "2023-01-02", "end": "2023-06-26"}}})
+    from_cli = steps.Cycle(load_config(), ops, "t", pd.Timestamp("2023-02-06"))
+    from_loop = steps.Cycle(load_config(), ops, "t", steps.weeks("2023-01-02", "2023-06-26")[5])
+    frames = [pd.DataFrame({"x": [1.0]}).assign(week=c.as_of) for c in (from_cli, from_loop)]
+    pd.testing.assert_frame_equal(*frames)
+    assert frames[0]["week"].dtype == "datetime64[ns]"

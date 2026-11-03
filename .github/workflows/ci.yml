@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.0  # exact tag: setup-uv has no moving major tags
-      - run: uvx ruff@0.17.1 check src app tests
+      - run: uvx ruff@0.17.1 check src app tests airflow
 
   test:
     runs-on: ubuntu-latest
@@ -33,3 +33,19 @@ jobs:
       # tests, run on the development machine only.
       - name: Tests
         run: uv run --no-sync pytest -m "not slow and not needs_local_run" -q
+
+  # The DAGs in Airflow's own venv (official constraints), as on the development machine: it
+  # never imports the project, so it needs none of the project's dependencies.
+  dags:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0  # exact tag: setup-uv has no moving major tags
+      - name: Install Airflow 3.3.2
+        run: |
+          uv venv --python 3.12 .venv-airflow
+          uv pip install --python .venv-airflow/bin/python -r airflow/requirements.txt \
+            -c https://raw.githubusercontent.com/apache/airflow/constraints-3.3.2/constraints-3.12.txt
+      - name: DAG tests
+        run: .venv-airflow/bin/python -m pytest airflow/tests -q

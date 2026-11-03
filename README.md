@@ -29,13 +29,14 @@ configs/config.yaml      # single source of truth
 src/forecasting/         # preprocessing, features, validation, model, pipeline
 src/simulation/          # VN2 replay engine, lost-sales anchor
 src/rl/                  # policy spec, environment and its batched twin, PPO / GRPO training, selection, test scoring
-src/serving/             # forecaster (and later the policy) as MLflow pyfunc models
+src/serving/             # forecaster and ordering policy as MLflow pyfunc models
 src/ops/                 # weekly production loop: drops, data contract, ledgers, monitors, decisions, registry
 src/utils/               # metrics, config, and tracking.py (MLflow setup, provenance, artifact cache)
 app/                     # Streamlit frontend (Home + 5 pages)
+airflow/                 # DAG factory (one DAG per ops environment), its tests and requirements
 notebooks/               # EDA and pipeline demos
 docs/mlflow.md           # MLflow + tracking-utility guide
-docs/ops.md              # the weekly ops loop: cycle, decisions, environments
+docs/ops.md              # the weekly ops loop: cycle, decisions, RL challenger, Airflow
 data/                    # VN2 competition CSVs
 ```
 
@@ -71,6 +72,19 @@ python -m src.rl.train --config configs/config.yaml --spec spec.json --seeds 42 
 # Score the validation champion once on the test block (locked afterwards)
 python -m src.rl.evaluate --config configs/config.yaml --forecast-run <run_id>
 ```
+
+### Option C — the weekly ops loop (production-like)
+
+```bash
+python -m src.ops.cli run --env dev     # every step of every week, in order (no orchestrator)
+
+make airflow-install                    # once: Airflow 3.3.2 in .venv-airflow (official constraints)
+make airflow-init                       # once: metadata DB and the 1-slot heavy pool
+make airflow                            # http://127.0.0.1:8080, one DAG per environment; unpause to replay
+```
+
+See [docs/ops.md](docs/ops.md): data contract, monitors, the retrain / keep / rollback rules, the RL
+challenger and the DAGs.
 
 ## MLflow
 

@@ -11,6 +11,7 @@ export MLFLOW_TRACKING_URI=http://127.0.0.1:5050
 python -m src.ops.cli run --env dev                        # every step of every week, in order
 python -m src.ops.cli step forecast --env dev --as-of 2023-10-09
 python -m src.ops.cli drops release --env live --week 3    # live: publish VN2 file Week3
+make airflow                                               # the same steps as Airflow DAGs (see Orchestration)
 ```
 
 ## Environments
@@ -137,6 +138,63 @@ trajectories read the same champion forecaster, so a forecaster refit doesn't br
     - for a retrain, one `rl-train` run per seed and a `policy-<D>` run with the validation metrics and the
       policy model.
 - **Models:** downloaded versions are cached under `artifacts/cache/models/<model_id>/`.
+
+## Orchestration (Airflow)
+
+`python -m src.ops.cli run` is the whole loop without an orchestrator. Airflow runs the same steps as one DAG
+per environment, with retries left to the operator, a UI per week and task, and one heavy job at a time
+across environments.
+
+```bash
+make airflow-install   # once: Airflow 3.3.2 in .venv-airflow, with the official constraints
+make airflow-init      # once: the metadata DB (airflow_home/) and the 1-slot heavy pool
+make airflow           # standalone on http://127.0.0.1:8080 (starts the MLflow server too)
+make airflow-stop      # stop it when idle (about 1 GB)
+```
+
+Log in as `admin`; the password is in `airflow_home/simple_auth_manager_passwords.json.generated`. Everything
+listens on 127.0.0.1 only.
+
+- **DAGs** (`airflow/dags/vn2_ops.py`): `vn2_<env>` for every environment in `configs/ops.yaml`. A new
+  environment appears on the next parse, paused.
+- **Shape:**
+  `drop` (sim) or `wait_for_drop` (live) → `ingest` → `score` → `monitor` → `decide` → `route_forecaster`
+  → `refit` → `forecast` → `route_policy` → `retrain` → `order` → `report`.
+  - Each step is `.venv/bin/python -m src.ops.cli step <name> …` in its own process. Airflow's venv never
+    imports the project.
+  - The two routes read `decision.json`. A refit or retrain that was decided against shows as *skipped*.
+- **Schedule:** one run per Monday from the environment's `start` to its `end`; the logical date is the
+  as-of week.
+  - Unpausing a sim DAG replays it (catchup), one week at a time.
+  - A failed week stops the next one (`depends_on_past`). Fix the cause and clear the failed task to resume.
+- **Live:** each run waits for its drop (a sensor in reschedule mode, which holds no worker slot while
+  waiting) until `python -m src.ops.cli drops release --env live --week K` publishes it. Drops are written
+  aside and renamed, so a waiting run never reads half of one.
+- **Resources:** `refit` and `retrain` take the 1-slot `heavy` pool, shared by all DAGs. At most 2 tasks run
+  at a time.
+- **Re-running:** clearing a task re-runs that step from the same inputs. `ingest` refuses a week when a
+  later week of the environment is done, because the registry already holds that later state; replaying from
+  an earlier week needs a fresh environment.
+  - In Airflow 3.3.2, `airflow tasks clear -t` matches task ids by **substring**, despite the flag's name
+    `--task-regex`: use `-t score -d` (with downstream), not `-t '^score$'`.
+- **Tests:** `.venv-airflow/bin/python -m pytest airflow/tests` covers the import, the graph, pools, dates and
+  routing. It runs in CI as the `dags` job.
+
+**Checked on `airflow-dev`** (2023-10-02 → 10-23, 2026-11-03):
+
+- **The run:** the 4 weeks ran in 4.6 min, about 45 s per week plus a CatBoost fit in weeks 1 and 3.
+  `cli run` takes about 10 s per week, so the extra time is process start-up and scheduler hops.
+  - Decisions: bootstrap, keep, refit (age 2), keep. Forecaster v2 is champion with v1 previous; the
+    policy is the anchor v1.
+- **Reproducibility:** each week's decisions, forecasts, orders and stock states are byte-identical to
+  `cli run` on a scratch store.
+  - The check caught one skew, now fixed: a step run from the CLI wrote the `week` column in a different
+    timestamp unit (equal values, different bytes).
+  - Clearing `score` and its downstream tasks twice gave the same 10 files both times.
+- **Memory** (physical footprint):
+  - Airflow standalone: 1.04 GB (scheduler, API server, DAG processor, triggerer and 2 executor workers).
+  - The MLflow server: 0.40 GB, plus 1.16 GB when its job runner is on. The runner only serves GenAI
+    features, so `make mlflow-server` turns it off (`MLFLOW_SERVER_ENABLE_JOB_EXECUTION=false`).
 
 ## First dev run (2023-10-02 → 2023-12-11, 11 weeks, 2 min)
 

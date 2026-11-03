@@ -1,0 +1,6 @@
+# The orchestrator's own venv, .venv-airflow (`make airflow-install`), installed with Airflow's
+# official constraints for 3.3.2 / Python 3.12. It never imports the project: every task runs the
+# project's CLI with .venv/bin/python, so the two environments can't conflict.
+apache-airflow==3.3.2
+apache-airflow-providers-standard==1.19.0
+pytest==9.1.1  # the DAG tests (airflow/tests); same version as the project's lock

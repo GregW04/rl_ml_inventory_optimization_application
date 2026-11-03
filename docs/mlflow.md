@@ -27,6 +27,8 @@ make backup          # consistent online copy of mlruns.db into backups/
 ```
 
 - Port 5050, because macOS's AirPlay Receiver holds 5000.
+- The server's job runner is off (`MLFLOW_SERVER_ENABLE_JOB_EXECUTION=false`). Its 7 huey workers (about
+  1.2 GB) only serve GenAI features such as trace evaluation and scorers, which this project doesn't use.
 - Always the venv's `mlflow` (`mlflow==3.14.0`): another MLflow version migrates the SQLite schema.
 - `mlruns.db` runs in WAL mode, so readers don't block the writer. Back it up with `make backup`
   (SQLite's `.backup`), never with `cp`. A plain `sqlite3 -readonly` session needs the `mlruns.db-shm` file,

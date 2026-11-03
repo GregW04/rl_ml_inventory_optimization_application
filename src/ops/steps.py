@@ -69,6 +69,11 @@ class Cycle:
     env: str
     as_of: pd.Timestamp
 
+    def __post_init__(self):
+        # One unit however the week arrives (a CLI string is seconds, a date range nanoseconds), so a
+        # step run by the orchestrator writes the same bytes as the in-process loop.
+        self.as_of = pd.Timestamp(self.as_of).as_unit("ns")
+
     @cached_property
     def config(self) -> dict:
         return env_config(self.base_config, self.ops, self.env)
@@ -274,6 +279,12 @@ def _sanity(new: pd.DataFrame, old: pd.DataFrame | None, rules: Rules) -> list[s
 
 def step_ingest(c: Cycle) -> None:
     """Check the week's drop against the data contract; open the cycle run and log the drop."""
+    # The registry holds the environment's state as of its latest week: replaying an earlier week
+    # on top of it would mix the two (re-running the latest week is fine).
+    later = [w for w in weeks(c.as_of + WEEK, c.settings.end) if (cycle_dir(c.base_config, c.env, w) / "done").exists()]
+    if later:
+        raise RuntimeError(f"{c.env} has already run {later[-1].date()}: weeks run in order, so replaying {c.day} "
+                           "needs a fresh environment.")
     sales_path, instock_path = drops.drop_paths(c.base_config, c.env, c.as_of)
     if not sales_path.exists():
         raise FileNotFoundError(f"No drop for {c.day} yet ({sales_path}).")

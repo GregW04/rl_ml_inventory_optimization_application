@@ -69,3 +69,12 @@ envs:
     model_params: {iterations: 150, depth: 4, learning_rate: 0.1, allow_writing_files: false}
     forecasting: {model: {name: catboost}, ensemble: {enabled: false}}
     rules: {max_age_weeks: 4}
+  # Orchestration check (make airflow): four weeks as an Airflow DAG, with an age refit in week 3,
+  # so the refit branch, the heavy pool and the keep branch all run.
+  airflow-dev:
+    kind: sim
+    start: "2023-10-02"
+    end: "2023-10-23"
+    model_params: {iterations: 150, depth: 4, learning_rate: 0.1, allow_writing_files: false}
+    forecasting: {model: {name: catboost}, ensemble: {enabled: false}}
+    rules: {strategy: fixed, max_age_weeks: 2}

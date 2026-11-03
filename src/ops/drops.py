@@ -12,6 +12,7 @@ A drop is ``sales_<as_of>.csv`` and ``instock_<as_of>.csv`` in ``ops/<env>/drops
 
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 
@@ -43,8 +44,12 @@ def cut(wide: pd.DataFrame, as_of: pd.Timestamp) -> pd.DataFrame:
 def _write(config: dict, env: str, as_of: pd.Timestamp, sales: pd.DataFrame, instock: pd.DataFrame) -> Path:
     sales_path, instock_path = drop_paths(config, env, as_of)
     sales_path.parent.mkdir(parents=True, exist_ok=True)
-    sales.to_csv(sales_path, index=False)
-    cut(instock, as_of).to_csv(instock_path, index=False)
+    # Each file appears whole (written aside, then renamed), the in-stock flags first: whoever
+    # waits for a drop (the live DAG) never reads half of one.
+    for frame, path in ((cut(instock, as_of), instock_path), (sales, sales_path)):
+        tmp = path.with_name(f".{path.name}.tmp")
+        frame.to_csv(tmp, index=False)
+        os.replace(tmp, path)
     return sales_path
 
 
