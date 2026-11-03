@@ -121,6 +121,12 @@ def _git(*args: str) -> str:
     return out.stdout if out.returncode == 0 else ""
 
 
+def git_state() -> tuple[str, bool]:
+    """The commit checked out and whether the code folders have uncommitted changes."""
+    sha = _git("rev-parse", "HEAD").strip()
+    return sha, bool(_git("status", "--porcelain", "--untracked-files=normal", "--", *CODE_PATHS).strip())
+
+
 def log_provenance(config: dict, run_id: str | None = None) -> None:
     """
     Tag a run (the active one by default) with the code it ran and log the effective config.

@@ -1,11 +1,16 @@
 # Weekly production loop (src/ops): environments, retrain/promotion rules and thresholds.
 # The thresholds are first values. The shadow replay calibrates them (Phase 6) and then sets
 # `frozen: true`; the live environment refuses rules that are not frozen.
-frozen: false
+frozen: true
+# The rules sim-final ran with (Rules.version()); a live environment runs only these.
+frozen_rules: 03f2617e8ceb
 
 rules:
   # never | fixed (refit at max age) | drift (refit on monitor alarms) | drift_backstop (either)
-  strategy: drift_backstop
+  # Chosen on the shadow replay (`cli compare`, 79 weeks paired by SKU-week): fixed 13 weeks was
+  # cheapest, at 1.2780 €/SKU-week with 6 refits. never was +1.54% (CI +0.41…+2.95); drift +0.12%
+  # (−0.40…+0.61) and drift_backstop +0.03% (−0.45…+0.48), both with 9 refits.
+  strategy: fixed
   max_age_weeks: 13
   # After a refit, drift alarms wait this many weeks (a severe bias alarm doesn't wait).
   cooldown_weeks: 4
@@ -13,6 +18,8 @@ rules:
     # Trigg's tracking signal per demand class on the weekly relative h0 error, restarted for
     # each forecaster version; it counts once `warmup_weeks` errors exist.
     alpha: 0.2
+    # Calibrated on sim-never (`cli calibrate`): the most sensitive setting within the budget of
+    # ≤ 1 false refit per 26 weeks on bias-free null paths (0.89; 0.80/2 gives 0.48, 0.85/2 0.26).
     limit: 0.74
     severe_limit: 0.9
     warmup_weeks: 4
@@ -21,6 +28,10 @@ rules:
     min_cost_share: 0.15
   coverage:
     # Share of SKU-weeks with sales <= q83_h2 over the trailing window, per demand class.
+    # A diagnostic, not a trigger: on sim-never no band meets the false-refit budget (≥ 1.34 per
+    # 26 weeks even at ±0.08). The window coverage swings 1.5–2.1× more than binomial, and the
+    # classes sit at different levels (0.78–0.84).
+    trigger: false
     window_weeks: 4
     band: [0.79, 0.88]
     persistence_weeks: 2
@@ -59,6 +70,52 @@ rules:
   n_boot: 1000
   seed: 42
 
+# Forecaster recipes environments share (an environment names one with `recipe:`).
+recipes:
+  # Research run 74602b75's structure: a CatBoost + LightGBM + XGBoost ensemble, Tweedie mean loss,
+  # demand-profile features, 6 measures. Its hyperparameters are tuned at T0 on data up to
+  # 2022-09-19 only: `python -m src.ops.cli tune --recipe champion --as-of 2022-10-03`.
+  champion:
+    forecasting:
+      measures:
+        - {kind: mean, horizon: 0}
+        - {kind: quantile, horizon: 0, tau: critical_ratio}
+        - {kind: mean, horizon: 1}
+        - {kind: quantile, horizon: 1, tau: critical_ratio}
+        - {kind: quantile, horizon: 2, tau: 0.5}
+        - {kind: quantile, horizon: 2, tau: critical_ratio}
+      features: {demand_profile: {enabled: true}}
+      model: {mean_objective: tweedie}
+      ensemble: {enabled: true, members: [catboost, lightgbm, xgboost]}
+    # Tuning run 7ae443bc (vn2-ops-recipes, 38.5 min): best q83_h2 pinball on the 2 folds is CatBoost 0.675,
+    # XGBoost 0.687, LightGBM 0.690.
+    model_params:
+      catboost:
+        iterations: 847
+        learning_rate: 0.037333778698995165
+        depth: 5
+        l2_leaf_reg: 19.10434965012926
+        subsample: 0.9837682171881091
+        rsm: 0.8736970936526044
+      lightgbm:
+        num_leaves: 127
+        learning_rate: 0.011058500546306244
+        n_estimators: 453
+        subsample: 0.5049815598437498
+        colsample_bytree: 0.7946688051690406
+        min_child_samples: 54
+        reg_alpha: 9.9268667705009
+        reg_lambda: 0.23021865252984508
+      xgboost:
+        max_depth: 4
+        learning_rate: 0.02343617000952847
+        n_estimators: 421
+        subsample: 0.6135695058254393
+        colsample_bytree: 0.7571114615865944
+        min_child_weight: 9
+        reg_alpha: 9.9268667705009
+        reg_lambda: 0.00695380566061063
+
 envs:
   # Short development replay: a cheap recipe and a short max age, so that refits, promotion
   # and probation all happen within a few weeks.
@@ -78,3 +135,45 @@ envs:
     model_params: {iterations: 150, depth: 4, learning_rate: 0.1, allow_writing_files: false}
     forecasting: {model: {name: catboost}, ensemble: {enabled: false}}
     rules: {strategy: fixed, max_age_weeks: 2}
+  # Meta-backtest of the refit strategies (Phase 6): the champion recipe tuned at T0, the anchor
+  # as the policy (RL off), the same 79 weeks of shadow replay. Paired on the same SKU-weeks, they
+  # compare never refitting, refitting on age, on drift alarms, and on either.
+  sim-never:
+    kind: sim
+    start: "2022-10-03"
+    end: "2024-04-01"
+    recipe: champion
+    rules: {strategy: never, policy: {enabled: false}}
+  sim-fixed13:
+    kind: sim
+    start: "2022-10-03"
+    end: "2024-04-01"
+    recipe: champion
+    rules: {strategy: fixed, max_age_weeks: 13, policy: {enabled: false}}
+  sim-drift:
+    kind: sim
+    start: "2022-10-03"
+    end: "2024-04-01"
+    recipe: champion
+    rules: {strategy: drift, policy: {enabled: false}}
+  sim-drift-backstop:
+    kind: sim
+    start: "2022-10-03"
+    end: "2024-04-01"
+    recipe: champion
+    rules: {strategy: drift_backstop, max_age_weeks: 13, policy: {enabled: false}}
+  # The final shadow replay: the frozen candidate rules with RL on, run as an Airflow DAG. Its
+  # champion forecaster and policy are what the live run starts from.
+  sim-final:
+    kind: sim
+    start: "2022-10-03"
+    end: "2024-04-01"
+    recipe: champion
+  # The ops test: the nine real VN2 drops, released one at a time (`cli drops release`), from the
+  # official initial state, run once under the frozen rules. It starts from sim-final's champions
+  # (`cli carry-over --from sim-final --to live`).
+  live:
+    kind: live
+    start: "2024-04-08"
+    end: "2024-06-03"
+    recipe: champion

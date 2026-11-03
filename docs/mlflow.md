@@ -216,12 +216,27 @@ orders = policy.predict(decision_frame)   # src.ops.rl.decision_frame(state, for
   - **Input:** the week's drop (context `weekly_drop`).
   - **Artifacts:** `cycle/`, a copy of the cycle folder.
 - **Children of a cycle run:**
-  - `bootstrap-<D>` / `refit-<D>`: the training data (input, context `training`) and the forecaster;
+  - `bootstrap-<D>` / `refit-<D>` / `retune-<D>`: the training data (input, context `training`), the
+    forecaster and `fit_seconds` (the fit itself; recorded from 2026-11-03);
   - `policy-bootstrap-<D>`: the anchor policy;
   - on a retrain, one `rl-train` run per seed and a `policy-<D>` run:
     - the `rl-train` runs follow the training-run layout above, with `forecast_run_id=ledger:<env>`;
     - `policy-<D>` logs `val_vs_anchor_pct` (also per seed, `val_vs_anchor_pct_s<seed>`),
       `seeds_beating_anchor` and the policy model.
+- **`challenge-<recipe>-<D>`** (`stage=challenge`): an operator's holdout test of a new recipe. It logs the paired €
+  (`delta_pct`, `ci_lo`, `ci_hi`, `evidence_weeks`), the `validation_status` tag and `recipe.json`.
+
+### `vn2-ops-recipes` and `vn2-ops-calibration` (setting the loop up)
+
+- **`tune-<recipe>-<D>`** (`stage=tune`, `cli tune`):
+  - params: the CV design, trials, metric and data digest;
+  - metrics per backend: `tuned_<metric>_<backend>`, `trials_<backend>`, `minutes_<backend>`;
+  - the `recipe_key` tag;
+  - artifacts: `recipe.json` and `model_params.yaml` (pasted into `configs/ops.yaml`).
+- **`calibration-<env>`** (`cli calibrate`): `calibration/` holds the threshold grids (`bias.csv`, `coverage.csv`),
+  `coverage_profile.csv`, the cost shares and the weekly class series they came from.
+- **`strategies`** (`cli compare`): `calibration/strategies.csv`, the paired € of each refit strategy against the
+  reference with its CI, refits and rollbacks.
 
 ## Duplicate-run guard
 

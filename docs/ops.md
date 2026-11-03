@@ -26,6 +26,45 @@ experiment (`vn2-ops-<env>`) and its own local state (`ops/<env>/`).
 Each environment's rules are the shared `rules` with its overrides applied. `dev` uses a cheap recipe and
 `max_age_weeks: 4`, so refits and probation happen within a few weeks.
 
+**Recipes.** An environment names a shared forecaster recipe (`recipe:` → `recipes.<name>` in
+`configs/ops.yaml`). A recipe is a set of overrides of `config.yaml`'s forecasting section (features, measures,
+backends, objective) plus `model_params`, the hyperparameters per ensemble member. The loop only *refits* a
+recipe; it never changes it. A recipe is (re)tuned by an operator on the data known at a week:
+
+```bash
+python -m src.ops.cli tune --recipe champion --as-of 2022-10-03 --trials 20 --folds 2 --fold-weeks 8
+```
+
+- Optuna tunes each ensemble member on the last CV folds before the fit cut, `as_of − 2 weeks`, the same cut
+  every refit uses.
+- The run goes to the experiment `vn2-ops-recipes` with `recipe.json`, its `recipe_key` and the
+  `model_params` to paste into the recipe.
+- `champion` is research run 74602b75's structure: CatBoost + LightGBM + XGBoost, Tweedie mean loss,
+  demand-profile features, 6 measures and the same 116 features. It is tuned at T0 = 2022-10-03 on data up to
+  2022-09-19 only.
+  - Only 76 weeks exist then, so 2 folds of 8 weeks fit after 52 training weeks.
+  - 20 trials per member, stopping after 10 trials without gain.
+
+**Retune: an operator's decision, checked on a holdout** (`src/ops/retune.py`). Add the new recipe to
+`recipes`, tune it, then challenge the environment's champion with it:
+
+```bash
+python -m src.ops.cli tune --recipe champion-2023q4 --as-of 2023-12-04
+python -m src.ops.cli challenge --env sim-final --recipe champion-2023q4 [--holdout-weeks 8] [--margin-pct 0.5]
+```
+
+- **The holdout.** The challenger is fit as cycle A's refit would have been (A = `holdout_weeks` ago). It then
+  issues every cycle's forecasts since, from that week's data. Both it and the champion's as-issued forecasts
+  drive the anchor from cycle A's live stock, so only the forecasts differ.
+- **The test.** Their € is paired by SKU on weeks A+3 … latest (6 weeks for an 8-week holdout), with a
+  bootstrap CI. The run is logged as `stage=challenge`.
+- **The outcome.** A win by `margin_pct` with the CI below 0 leaves a request. The next cycle decides
+  **retune**, and the refit step fits the new recipe on all the data, sanity-checks it and promotes it, with the
+  usual probation. The version is tagged `trigger=retune`, `recipe`, `challenge_run_id` and
+  `holdout_delta_pct`.
+- **The constraint.** A new recipe has to forecast every measure the champion does, because the anchor and the
+  policy read them.
+
 ## A cycle (`as_of = D`, the drop's last week)
 
 | Step | What it does |
@@ -60,9 +99,10 @@ error monitors and probation.
 |---|---|---|
 | 1 | No champion yet | **bootstrap** |
 | 2 | On probation: € worse than `@previous` by more than `rollback_margin_pct`, CI above 0, at least `min_evidence_weeks` | **rollback** |
-| 3 | Strategy `never` | **keep** |
-| 4 | Age ≥ `max_age_weeks` (`fixed`, `drift_backstop`), or a bias / coverage alarm for `persistence_weeks` in a class with ≥ `min_cost_share` of the cost, after the cooldown (a severe bias alarm skips it) (`drift`, `drift_backstop`) | **refit** |
-| 5 | Otherwise; input diagnostics (PSI, zero share, level vs last year, class churn) never retrain on their own | **keep** |
+| 3 | An operator's challenge won with a new recipe (see Retune) | **retune** |
+| 4 | Strategy `never` | **keep** |
+| 5 | Age ≥ `max_age_weeks` (`fixed`, `drift_backstop`), or a bias / coverage alarm for `persistence_weeks` in a class with ≥ `min_cost_share` of the cost, after the cooldown (a severe bias alarm skips it) (`drift`, `drift_backstop`) | **refit** |
+| 6 | Otherwise; input diagnostics (PSI, zero share, level vs last year, class churn) never retrain on their own | **keep** |
 
 A refit is promoted unless sanity checks fail: missing or negative forecasts, q50 above q83, or a forecast
 total more than `max_total_change_pct` away from the champion's. Version tags record the audit trail:
@@ -198,6 +238,9 @@ listens on 127.0.0.1 only.
 
 ## First dev run (2023-10-02 → 2023-12-11, 11 weeks, 2 min)
 
+Reset and re-run on 2026-11-03 with the policy layer, it reproduced every decision, forecast, order and
+cost of the first run exactly.
+
 - **Decisions:** bootstrap, then age refits on 10-30 and 11-27, both promoted.
 - **Shadow costs:** the previous forecaster's shadow costs equal live for two weeks after each promotion, then
   diverge. On 11-20, v2 cost 2.038 vs v1's 2.232 €/SKU.
@@ -221,3 +264,101 @@ rules of `configs/ops.yaml`.
     rounding bug, now fixed.
   - Under the fixed rule it would have been promoted, and the fallback check would have watched it from
     there.
+
+## Shadow replay and calibration (Phase 6, 2026-11-03)
+
+All runs replay 2022-10-03 → 2024-04-01 (79 cycles) with the `champion` recipe, which was tuned at T0 on data up
+to 2022-09-19 only.
+
+**The never-refit T0 model** (`sim-never`) shows the regime change the planning evidence predicted. Mean
+relative error of `mean_h0`, (sales − forecast) / forecast, by quarter:
+
+| class (cost share) | 22Q4 | 23Q1 | 23Q2 | 23Q3 | 23Q4 | 24Q1 | 24Q2 |
+|---|---|---|---|---|---|---|---|
+| Smooth (37%) | +3.0 | −2.6 | +3.5 | −1.4 | +6.6 | −1.6 | +3.4 |
+| Intermittent (26%) | +5.7 | +9.4 | +6.2 | +2.5 | −9.6 | −15.5 | −5.4 |
+| Erratic (21%) | −3.0 | +25.1 | +5.4 | +10.9 | +26.4 | +7.5 | +62.2 |
+| Lumpy (16%) | +12.3 | +4.5 | +18.7 | +5.0 | +2.6 | −10.5 | −27.9 |
+
+- **Intermittent and Lumpy** are under-forecast through the 2023 growth and over-forecast in the 2024 decline.
+  Their `q83_h2` coverage then rises above nominal (0.875 and 0.943).
+- **Erratic** is a small class, about 42 SKU-weeks a week, and is noisy and mostly under-forecast.
+
+**Calibration** (`python -m src.ops.cli calibrate --env sim-never`; MLflow experiment `vn2-ops-calibration`):
+
+- **The null.** The replay's own weekly class series, with the slow drift removed (a centred 13-week mean),
+  resampled in 4-week blocks jointly across classes. The decision rule then runs on 200 null paths of
+  78 weeks with the loop's own code.
+- **Bias.** False refits per 26 weeks:
+
+  | limit | persistence 1 | 2 | 3 |
+  |---|---|---|---|
+  | 0.70 | 2.07 | 1.11 | 0.73 |
+  | 0.74 | 1.56 | 0.89 | 0.50 |
+  | 0.80 | 0.92 | 0.48 | 0.26 |
+  | 0.85 | 0.51 | 0.26 | 0.15 |
+
+  The budget is ≤ 1 per 26 weeks, and the most sensitive setting within it, 0.74 / 2, is kept. On the real
+  series it first fires on 2022-11-07, five weeks after T0, on a Smooth over-forecast (tracking signal
+  −0.93). 0.80 / 2 would first fire on 2023-04-03.
+- **Coverage becomes a diagnostic** (`coverage.trigger: false`). No band meets the budget: ±0.03 … ±0.08
+  around 0.833 or around the recipe's own 0.820 gives 1.34–3.39 false refits per 26 weeks.
+  - The 4-week coverage swings 1.5–2.1× more than a binomial: design effects 2.1–4.4, from weekly shocks the
+    SKUs share.
+  - The classes sit at different levels: Erratic 0.778, Smooth 0.797, Lumpy 0.818, Intermittent 0.838.
+- **The class biases are partly structural.** A fresh refit keeps them: Lumpy +13.6% (v1) and +10.6% (v2), and
+  Erratic +26% (v2) in `sim-fixed13`. Trigg's signal flags any persistent bias, so the drift rule refits again
+  and again on these classes. The strategy comparison below shows what that is worth.
+- **Probation** in `sim-fixed13`: refits gained 0.4–1.2% against the previous model in every evidence week.
+  The 2023-04-03 refit was rolled back on 2023-05-01: +3.05% after one evidence week and +3.02% after two
+  (CI [+0.01%, +5.85%]). It was consistently worse, but the CI only just cleared 0.
+
+**Strategy comparison** (`python -m src.ops.cli compare …`): the four backtests have the anchor as the policy and
+identical demand, so their costs pair on the same in-stock SKU-weeks. The CI is a bootstrap over 4-week blocks.
+
+| strategy | € / SKU-week | vs fixed13 | 95% CI | refits | rollbacks |
+|---|---|---|---|---|---|
+| never | 1.2977 | +1.54% | +0.41 … +2.95 | 0 | 0 |
+| **fixed13** | **1.2780** | — | — | **6** | 1 |
+| drift | 1.2795 | +0.12% | −0.40 … +0.61 | 9 | 0 |
+| drift_backstop | 1.2784 | +0.03% | −0.45 … +0.48 | 9 | 0 |
+
+- **The rule, fixed before the results:** the lowest €, unless its edge over a cheaper strategy has a CI that
+  includes 0. **fixed13** wins on both counts: it beats the only cheaper strategy (never) clearly, and the drift
+  strategies tie it with 50% more refits.
+- **Freshness again.** The gain over never grows with the model's age, from 0% in 2022Q4 to −4.9% in 2023Q4.
+  It matches the research result: refits every 13 weeks gave −1.49% on `rl_train`.
+- **What the drift alarms did.** They caught the real shifts, for example 2023-10-16 (Intermittent −0.99,
+  Lumpy −0.87, the start of the decline). But refitting on them didn't beat a steady 13-week rhythm.
+- **What stays on.** The monitors keep running as logged signals (`bias_ts_*` and `coverage_q83_*` on the
+  timeline run); only the trigger is age.
+
+**The final replay** (`sim-final`: the chosen rules with RL on, run as the Airflow DAG `vn2_sim-final`, 79 weeks):
+
+- **Same forecaster as the backtest.** It is byte-identical to `sim-fixed13` in all 79 decisions, forecasts and
+  realised costs. The ensemble refits are deterministic across processes and orchestrators, so RL is the only
+  difference.
+- **RL challengers.** One every 13 weeks once the ledger was long enough:
+
+  | as of | validation-picked gate | vs anchor | seeds beating it | outcome |
+  |---|---|---|---|---|
+  | 2023-06-26 | Smooth | −0.40% | 2 of 3 | rejected: margin (needs −0.5%) |
+  | 2023-09-25 | Smooth, Intermittent, Lumpy | −2.27% | 3 of 3 | rejected: units (Intermittent −7…−10%, Lumpy −6…−13%) |
+  | 2023-12-25 | Intermittent, Lumpy | −0.74% | 3 of 3 | rejected: units (−5…−9%) |
+  | 2024-03-25 | Intermittent, Lumpy | −0.81% | 3 of 3 | **promoted** (policy v5) |
+
+  - **The units rule.** In the decline, the challengers learned to undercut a forecaster that over-forecasts
+    Intermittent and Lumpy. The units rule (within ±2% of the anchor in every seed) refused that trend bet
+    until a challenger won without it.
+  - **The promoted policy.** v5 decides the orders of 447–450 of the 599 SKUs, its gate. Its first orders
+    arrive after the replay ends, so the live run is its first realised test, against the anchor's shadow.
+- **Freeze.** `frozen: true` and `frozen_rules: 03f2617e8ceb` (the version of the rules `sim-final` ran). The
+  `live` environment runs only these rules, from a clean tree.
+
+**Disk.** The backtests filled the disk. The tuned ensemble's `forecaster.joblib` was 394 MB, about 40 versions
+were made, and each model was stored twice: in `mlartifacts/` and in the download cache.
+
+- Forecasters are now saved with zlib (`SAVE_COMPRESSION = 3`): 28 MB, and loading is faster (1.2 s instead of
+  5.4 s).
+- While the disk was full, Airflow's scheduler died: standalone couldn't write its log. `make airflow-stop` and
+  `make airflow` restarted it; the queued runs resumed, after clearing the tasks that had failed.

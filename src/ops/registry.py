@@ -36,6 +36,11 @@ def register(model_uri: str, name: str, tags: dict | None = None) -> ModelVersio
     return mlflow.register_model(model_uri, name, tags={k: str(v) for k, v in (tags or {}).items()})
 
 
+def copy_version(source: ModelVersion, name: str, tags: dict | None = None) -> ModelVersion:
+    """A version of ``name`` serving the same logged model as ``source``, with its tags and ``tags`` on top."""
+    return register(source.source, name, {**source.tags, **(tags or {})})
+
+
 def resolve(name: str, alias: str) -> ModelVersion | None:
     """The version behind ``alias``, or None when the alias (or the model) doesn't exist."""
     try:

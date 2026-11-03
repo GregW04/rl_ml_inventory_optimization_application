@@ -58,43 +58,59 @@ def _scored(forecasts: pd.DataFrame, actuals: pd.DataFrame, column: str, horizon
     return out[out["sales"].notna()]
 
 
-def bias_signals(forecasts: pd.DataFrame, actuals: pd.DataFrame, rules: Rules) -> dict:
-    """Per class: the latest tracking signal, how many weeks in a row it is past the limit, errors."""
+def weekly_errors(forecasts: pd.DataFrame, actuals: pd.DataFrame) -> pd.DataFrame:
+    """Week × class relative error of ``mean_h0``: Σ(sales − forecast) / Σ forecast over in-stock SKU-weeks."""
     scored = _scored(forecasts, actuals, "mean_h0", 0)
-    out = {}
-    for cls, g in scored.groupby("demand_class"):
-        weekly = g.groupby("week")[["sales", "mean_h0"]].sum().sort_index()
-        weekly = weekly[weekly["mean_h0"] > 0]
-        errors = ((weekly["sales"] - weekly["mean_h0"]) / weekly["mean_h0"]).to_numpy()
-        ts = trigg_signal(errors, rules.bias.alpha)
-        counted = ts[rules.bias.warmup_weeks - 1:] if len(ts) >= rules.bias.warmup_weeks else np.array([])
-        out[cls] = {
-            "weeks": int(len(errors)),
-            "ts": float(counted[-1]) if len(counted) else None,
-            "streak": _streak([abs(v) > rules.bias.limit for v in counted]),
-            "severe": bool(len(counted) and abs(counted[-1]) > rules.bias.severe_limit),
-        }
-    return out
+    weekly = scored.groupby(["week", "demand_class"])[["sales", "mean_h0"]].sum()
+    weekly = weekly[weekly["mean_h0"] > 0]
+    return ((weekly["sales"] - weekly["mean_h0"]) / weekly["mean_h0"]).unstack("demand_class").sort_index()
+
+
+def weekly_hits(forecasts: pd.DataFrame, actuals: pd.DataFrame, column: str = "q83_h2") -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Week × class count of in-stock SKU-weeks with sales ≤ ``column``, and of all scored ones."""
+    scored = _scored(forecasts, actuals, column, 2)
+    scored = scored.assign(hit=(scored["sales"] <= scored[column]).astype(float))
+    weekly = scored.groupby(["week", "demand_class"])["hit"].agg(["sum", "count"])
+    return weekly["sum"].unstack("demand_class").sort_index(), weekly["count"].unstack("demand_class").sort_index()
+
+
+def bias_state(errors: np.ndarray, rules: Rules) -> dict:
+    """One class's tracking signal since promotion: latest value, weeks in a row past the limit, severity."""
+    ts = trigg_signal(errors, rules.bias.alpha)
+    counted = ts[rules.bias.warmup_weeks - 1:] if len(ts) >= rules.bias.warmup_weeks else np.array([])
+    return {
+        "weeks": int(len(errors)),
+        "ts": float(counted[-1]) if len(counted) else None,
+        "streak": _streak([abs(v) > rules.bias.limit for v in counted]),
+        "severe": bool(len(counted) and abs(counted[-1]) > rules.bias.severe_limit),
+    }
+
+
+def coverage_state(hits: np.ndarray, counts: np.ndarray, rules: Rules) -> dict:
+    """One class's trailing-window coverage since promotion and weeks in a row out of band."""
+    lo, hi = rules.coverage.band
+    w = rules.coverage.window_weeks
+    cov = [hits[i - w + 1:i + 1].sum() / counts[i - w + 1:i + 1].sum() for i in range(w - 1, len(hits))
+           if counts[i - w + 1:i + 1].sum() > 0]
+    return {"weeks": int(len(hits)), "value": float(cov[-1]) if cov else None,
+            "streak": _streak([not lo <= v <= hi for v in cov])}
+
+
+def bias_signals(forecasts: pd.DataFrame, actuals: pd.DataFrame, rules: Rules) -> dict:
+    """Per class: the latest tracking signal, how many weeks in a row it is past the limit."""
+    errors = weekly_errors(forecasts, actuals)
+    return {str(cls): bias_state(errors[cls].dropna().to_numpy(), rules) for cls in errors.columns}
 
 
 def coverage_signals(forecasts: pd.DataFrame, actuals: pd.DataFrame, rules: Rules, column: str = "q83_h2") -> dict:
     """Per class: trailing-window coverage of ``column`` and how many weeks in a row it is out of band."""
     if column not in forecasts.columns:
         return {}
-    scored = _scored(forecasts, actuals, column, 2)
-    scored = scored.assign(hit=(scored["sales"] <= scored[column]).astype(float))
-    lo, hi = rules.coverage.band
-    w = rules.coverage.window_weeks
+    hits, counts = weekly_hits(forecasts, actuals, column)
     out = {}
-    for cls, g in scored.groupby("demand_class"):
-        weekly = g.groupby("week")["hit"].agg(["sum", "count"]).sort_index()
-        hits, n = weekly["sum"].rolling(w).sum(), weekly["count"].rolling(w).sum()
-        cov = (hits / n).dropna()
-        out[cls] = {
-            "weeks": int(len(weekly)),
-            "value": float(cov.iloc[-1]) if len(cov) else None,
-            "streak": _streak([not lo <= v <= hi for v in cov]),
-        }
+    for cls in hits.columns:
+        h = hits[cls].dropna()  # the weeks the class was scored
+        out[str(cls)] = coverage_state(h.to_numpy(), counts.loc[h.index, cls].to_numpy(), rules)
     return out
 
 

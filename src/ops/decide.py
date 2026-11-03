@@ -5,12 +5,13 @@ It reads and writes nothing, so every branch is unit-tested (tests/test_ops_unit
 1. no champion yet → **bootstrap**
 2. the champion is on probation and its realised € is worse than the shadow on the previous
    forecaster by more than the margin, with the whole CI above 0 → **rollback**
-3. strategy ``never`` → **keep**
-4. a due refit: age ≥ ``max_age_weeks`` (strategies ``fixed``, ``drift_backstop``), or a drift
+3. an operator's challenge won with a new recipe (``src/ops/retune.py``) → **retune**
+4. strategy ``never`` → **keep**
+5. a due refit: age ≥ ``max_age_weeks`` (strategies ``fixed``, ``drift_backstop``), or a drift
    alarm (``drift``, ``drift_backstop``) after the cooldown; a severe bias alarm skips the
    cooldown. Drift alarms only count in classes carrying ≥ ``min_cost_share`` of the cost
    → **refit** (same recipe)
-5. otherwise → **keep**. Input-side diagnostics alone never retrain.
+6. otherwise → **keep**. Input-side diagnostics alone never retrain.
 
 The policy layer decides separately (``decide_policy``):
 
@@ -29,7 +30,7 @@ from dataclasses import asdict, dataclass, field
 
 from src.ops.settings import Rules
 
-ACTIONS = ("bootstrap", "rollback", "refit", "keep")
+ACTIONS = ("bootstrap", "rollback", "retune", "refit", "keep")
 POLICY_ACTIONS = ("bootstrap", "fallback", "retrain", "keep")
 
 
@@ -51,7 +52,7 @@ def drift_alarms(signals: dict, rules: Rules) -> tuple[list[str], bool]:
         if cls in big and b.get("streak", 0) >= rules.bias.persistence_weeks:
             reasons.append(f"bias {cls}: tracking signal {b['ts']:+.2f} past ±{rules.bias.limit} for {b['streak']} weeks")
             severe = severe or bool(b.get("severe"))
-    for cls, c in signals.get("coverage", {}).items():
+    for cls, c in signals.get("coverage", {}).items() if rules.coverage.trigger else ():
         if cls in big and c.get("streak", 0) >= rules.coverage.persistence_weeks:
             lo, hi = rules.coverage.band
             reasons.append(f"coverage {cls}: {c['value']:.3f} outside [{lo}, {hi}] for {c['streak']} weeks")
@@ -69,6 +70,12 @@ def decide(signals: dict, rules: Rules) -> Decision:
             return Decision("rollback", [
                 f"probation: realised € {p['delta_pct']:+.2f}% vs the previous forecaster over "
                 f"{p['evidence_weeks']} weeks (CI {p['ci_lo']:+.2f}…{p['ci_hi']:+.2f}%)"])
+
+    r = signals.get("pending_recipe")
+    if r:
+        return Decision("retune", [
+            f"operator: recipe {r['recipe']} beat the champion by {r['delta_pct']:+.2f}% on the holdout to "
+            f"{r['as_of']} (CI {r['ci_lo']:+.2f}…{r['ci_hi']:+.2f}%, challenge run {r['run_id']})"])
 
     if rules.strategy == "never":
         return Decision("keep", ["strategy never"])

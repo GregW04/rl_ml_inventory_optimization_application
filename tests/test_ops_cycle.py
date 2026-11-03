@@ -115,3 +115,44 @@ def test_rl_challenger_trains_on_the_ledger_and_serves_with_an_anchor_shadow(tmp
     cycle_30 = [r for r in runs if r.data.tags.get("stage") == "cycle" and r.data.tags.get("as_of") == "2023-10-30"][0]
     assert len(training) == 2 and all(r.data.tags["mlflow.parentRunId"] == cycle_30.info.run_id for r in training)
     assert not client.search_runs([mlflow.get_experiment_by_name("Default").experiment_id])
+
+
+RECIPES = {
+    "cheap": {"forecasting": {"model": {"name": "catboost"}, "ensemble": {"enabled": False}},
+              "model_params": {"iterations": 30, "depth": 3, "learning_rate": 0.2, "allow_writing_files": False}},
+    "cheap-deeper": {"forecasting": {"model": {"name": "catboost"}, "ensemble": {"enabled": False}},
+                     "model_params": {"iterations": 60, "depth": 5, "learning_rate": 0.1, "allow_writing_files": False}},
+}
+CHALLENGE_ENV = {"kind": "sim", "start": "2023-08-07", "end": "2023-10-23", "recipe": "cheap", "rules": {"strategy": "never"}}
+
+
+@pytest.mark.slow
+def test_an_operator_challenge_scores_a_recipe_and_a_won_one_is_refit_next_week(tmp_path):
+    from src.forecasting.recipe import Recipe
+    from src.ops import retune
+    from src.ops.settings import env_dir, recipe_config
+
+    config = load_config()
+    config["_project_root"] = str(tmp_path)
+    ops = OpsConfig.model_validate({"recipes": RECIPES, "envs": {"c": CHALLENGE_ENV}})
+    run_env(config, ops, "c", end="2023-10-16")
+    out = retune.challenge(config, ops, "c", "cheap-deeper", holdout_weeks=8)
+    # Cycle A = 08-21; its orders reach the shelves from 09-11, so 6 of the 8 holdout weeks can differ.
+    assert out["evidence_weeks"] == 6 and out["as_of"] == "2023-10-16"
+    pending = env_dir(config, "c") / retune.PENDING
+    assert pending.exists() == out["passed"]
+
+    # A won challenge, as the operator's run would leave it (whatever this holdout said):
+    recipe = Recipe.from_config(recipe_config(config, ops, "cheap-deeper"), RECIPES["cheap-deeper"]["model_params"])
+    pending.write_text(json.dumps({**out, "passed": True, "delta_pct": -1.0, "ci_lo": -2.0, "ci_hi": -0.1,
+                                   "recipe_dict": recipe.to_dict()}), encoding="utf-8")
+    run_env(config, ops, "c")
+    decision = pd.read_json(cycle_dir(config, "c", pd.Timestamp("2023-10-23")) / "decision.json", typ="series")
+    assert decision["action"] == "retune"
+    champion = registry.resolve(registry.model_name("c", "forecaster"), registry.CHAMPION)
+    assert str(champion.version) == "2" and champion.tags["trigger"] == "retune" and champion.tags["recipe"] == "cheap-deeper"
+    assert champion.tags["challenge_run_id"] == out["run_id"] and champion.tags["recipe_key"] == recipe.key()
+    assert not pending.exists()
+    runs = MlflowClient().search_runs([MlflowClient().get_experiment_by_name("vn2-ops-c").experiment_id],
+                                      "tags.stage = 'challenge'")
+    assert len(runs) == 1 and runs[0].info.run_id == out["run_id"]

@@ -43,9 +43,21 @@ from src.forecasting.measures import HORIZONS, infer_measures
 from src.forecasting.model import build_feature_matrix
 from src.forecasting.preprocessing import build_target_columns, load_master, load_sales_panel
 from src.forecasting.recipe import PANEL_COLUMNS, Recipe, fit_recipe, forecast, panel_digest
-from src.ops import contract, drops, ledger, monitor, registry, rl
+from src.ops import contract, drops, ledger, monitor, registry, retune, rl
 from src.ops.decide import Decision, decide, decide_policy
-from src.ops.settings import Env, OpsConfig, Rules, cycle_dir, dump, env_config, env_dir, env_rules, env_settings, weeks
+from src.ops.settings import (
+    Env,
+    OpsConfig,
+    Rules,
+    cycle_dir,
+    dump,
+    env_config,
+    env_dir,
+    env_model_params,
+    env_rules,
+    env_settings,
+    weeks,
+)
 from src.rl.vn2_data import context_features
 from src.serving.forecaster import log_forecaster
 from src.serving.policy import log_policy
@@ -251,7 +263,7 @@ def on_probation(c: Cycle) -> bool:
     return c.as_of <= end
 
 
-def _ledger(c: Cycle, name: str, since: pd.Timestamp) -> pd.DataFrame:
+def read_ledger(c: Cycle, name: str, since: pd.Timestamp) -> pd.DataFrame:
     parts = [pd.read_parquet(p) for w in weeks(min(since, c.as_of), c.as_of)
              if (p := cycle_dir(c.base_config, c.env, w) / name).exists()]
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
@@ -266,7 +278,7 @@ def _sanity(new: pd.DataFrame, old: pd.DataFrame | None, rules: Rules) -> list[s
         problems.append("negative forecasts")
     if {"q50_h2", "q83_h2"} <= set(ids) and (new["q50_h2"] > new["q83_h2"] + 1e-9).any():
         problems.append("q50_h2 above q83_h2")
-    for m in ids if old is not None else []:
+    for m in [m for m in ids if m in old.columns] if old is not None else []:
         change = 100.0 * (new[m].sum() / max(old[m].sum(), 1e-9) - 1.0)
         if abs(change) > rules.sanity.max_total_change_pct:
             problems.append(f"{m} total {change:+.1f}% vs the champion")
@@ -279,6 +291,14 @@ def _sanity(new: pd.DataFrame, old: pd.DataFrame | None, rules: Rules) -> list[s
 
 def step_ingest(c: Cycle) -> None:
     """Check the week's drop against the data contract; open the cycle run and log the drop."""
+    if c.settings.kind == "live":
+        _, dirty = tracking.git_state()
+        problems = [] if c.ops.frozen and c.ops.frozen_rules == c.rules.version() else \
+            [f"its rules ({c.rules.version()}) aren't the frozen ones ({c.ops.frozen_rules})"]
+        if dirty:
+            problems.append("the code has uncommitted changes")
+        if problems:
+            raise RuntimeError(f"The live environment refuses to run: {'; '.join(problems)}.")
     # The registry holds the environment's state as of its latest week: replaying an earlier week
     # on top of it would mix the two (re-running the latest week is fine).
     later = [w for w in weeks(c.as_of + WEEK, c.settings.end) if (cycle_dir(c.base_config, c.env, w) / "done").exists()]
@@ -315,6 +335,8 @@ def step_score(c: Cycle) -> None:
         state = (ledger.initial_state_vn2(c.config["data"]["initial_state_file"]) if c.settings.kind == "live"
                  else ledger.initial_state_proxy(p, c.as_of))
         c.write("state_live.parquet", state)
+        if (policy_info(c) or {}).get("kind") == "ppo":  # a carried-over RL policy: its anchor shadow starts with it
+            c.write("state_anchor.parquet", state)
         return
     week = p[p["date"] == c.as_of]
     demand = pd.DataFrame({"store": week["store"].to_numpy(), "product": week["product"].to_numpy(),
@@ -340,26 +362,28 @@ def step_monitor(c: Cycle) -> None:
     signals: dict = {"as_of": c.day, "champion": info}
     if info is not None:
         promoted = pd.Timestamp(info["promoted_as_of"])
-        fc = _ledger(c, "forecasts_champion.parquet", promoted)
+        fc = read_ledger(c, "forecasts_champion.parquet", promoted)
         fc = fc[fc["version"] == info["version"]] if len(fc) else fc
         if len(fc):
             signals["bias"] = monitor.bias_signals(fc, actuals, c.rules)
             signals["coverage"] = monitor.coverage_signals(fc, actuals, c.rules)
-        costs = _ledger(c, "costs_live.parquet", c.as_of - monitor.COST_SHARE_WEEKS * WEEK)
+        costs = read_ledger(c, "costs_live.parquet", c.as_of - monitor.COST_SHARE_WEEKS * WEEK)
         if len(costs):
             costs = costs.merge(classes.rename(columns={"date": "week"}), on=[*KEYS, "week"])
             signals["cost_share"] = monitor.cost_share(costs)
         if c.has("costs_previous.parquet"):
             signals["probation"] = monitor.probation_signal(
-                _ledger(c, "costs_live.parquet", promoted), _ledger(c, "costs_previous.parquet", promoted), promoted, c.rules)
+                read_ledger(c, "costs_live.parquet", promoted), read_ledger(c, "costs_previous.parquet", promoted), promoted, c.rules)
     signals["diagnostics"] = monitor.diagnostics(p, classes, c.as_of, pd.Timestamp(info["fit_as_of"]) if info else None)
+    if (request := retune.pending(c.base_config, c.env)) is not None:
+        signals["pending_recipe"] = {k: v for k, v in request.items() if k != "recipe_dict"}
     policy = signals["policy"] = policy_info(c)
     signals["rl_eligible"] = rl.eligible(c.as_of, c.first_forecast_week, c.rules.policy)
     if policy and policy["kind"] == "ppo":
         promoted = pd.Timestamp(policy["promoted_as_of"])
         if c.has("costs_anchor.parquet"):
             signals["policy_vs_anchor"] = monitor.policy_signal(
-                _ledger(c, "costs_live.parquet", promoted), _ledger(c, "costs_anchor.parquet", promoted), promoted,
+                read_ledger(c, "costs_live.parquet", promoted), read_ledger(c, "costs_anchor.parquet", promoted), promoted,
                 c.as_of, c.rules)
         if policy["gate"]:
             signals["gate_churn"] = monitor.gate_churn(classes, policy["gate"], pd.Timestamp(policy["fit_as_of"]), c.as_of)
@@ -372,7 +396,7 @@ def step_decide(c: Cycle) -> None:
 
 
 def step_refit(c: Cycle) -> None:
-    """Act on the decision: bootstrap or refit (then sanity-check and promote), or roll back."""
+    """Act on the decision: bootstrap, refit or retune (then sanity-check and promote), or roll back."""
     raw = c.read("decision.json")
     d, client, name = Decision(raw["action"], raw["reasons"]), MlflowClient(), c.model_name
     if d.action == "rollback":
@@ -383,31 +407,40 @@ def step_refit(c: Cycle) -> None:
         client.set_model_version_tag(name, restored, "promoted_as_of", c.day)
         c.path("state_previous.parquet").unlink(missing_ok=True)
         return
-    if d.action not in ("bootstrap", "refit"):
+    if d.action not in ("bootstrap", "refit", "retune"):
         return
     p = panel(c)
     history = p[PANEL_COLUMNS]
     champion = registry.resolve(name, registry.CHAMPION)
-    if champion is None:
-        recipe = Recipe.from_config(c.config, c.settings.model_params)
+    request = retune.pending(c.base_config, c.env) if d.action == "retune" else None
+    if request is not None:  # the recipe an operator's challenge won
+        recipe = Recipe.from_dict(request["recipe_dict"])
+    elif champion is None:
+        recipe = Recipe.from_config(c.config, env_model_params(c.ops, c.env))
     else:
         recipe = Recipe.from_dict(load_model(c, champion).unwrap_python_model().meta["recipe"])
     used = recipe.apply(c.config)
+    started = time.time()
     model = fit_recipe(build_feature_matrix(p, used), recipe, c.config, c.as_of)
+    fit_seconds = time.time() - started
     digest = panel_digest(p)
     # The experiment is explicit: without it the run (and its model files) would go to the store's
     # Default experiment, whose artifacts live in ./mlruns/0.
     with mlflow.start_run(run_name=f"{d.action}-{c.day}", experiment_id=experiment_id(c), parent_run_id=cycle_run(c),
                           tags={"stage": d.action, "env": c.env, "as_of": c.day}):
         tracking.log_provenance(c.config)
+        mlflow.log_metric("fit_seconds", fit_seconds)
         source = str(drops.drop_paths(c.base_config, c.env, c.as_of)[0])
         mlflow.log_input(mlflow.data.from_pandas(history, source=source, name=f"vn2-sales-{c.day}"), context="training")
         info = log_forecaster(model, recipe, c.config, history, load_master(c.config["data"]["master_file"]),
                               c.as_of, digest)
-    version = str(registry.register(info.model_uri, name, {
-        "trigger": d.action, "as_of": c.day, "recipe_key": recipe.key(), "data_digest": digest,
-        "validation_status": "pending", "reasons": "; ".join(d.reasons)[:500],
-    }).version)
+    tags = {"trigger": d.action, "as_of": c.day, "recipe_key": recipe.key(), "data_digest": digest,
+            "validation_status": "pending", "reasons": "; ".join(d.reasons)[:500]}
+    if request is not None:
+        tags.update(recipe=request["recipe"], challenge_run_id=request["run_id"],
+                    holdout_delta_pct=f"{request['delta_pct']:+.3f}")
+        (env_dir(c.base_config, c.env) / retune.PENDING).unlink()  # acted on, whatever the sanity check says
+    version = str(registry.register(info.model_uri, name, tags).version)
     old = None if champion is None else load_model(c, champion).predict(history, params={"as_of": c.day})
     problems = _sanity(forecast(model, p, c.as_of, used), old, c.rules)
     if problems:
@@ -466,7 +499,7 @@ def _train_policy(c: Cycle, example: pd.DataFrame) -> None:
     from src.serving.policy import actor_arrays
 
     pr = c.rules.policy
-    fc = _ledger(c, "forecasts_champion.parquet", c.first_forecast_week - WEEK)
+    fc = read_ledger(c, "forecasts_champion.parquet", c.first_forecast_week - WEEK)
     data = rl.ledger_run_data(panel(c), fc, c.as_of, pr, c.vn2, fit_dates(c))
     spec = rl.ops_spec(c.config, pr, data, c.env)
     train_eps, val_eps = block_episodes(c.config, data, "rl_train"), block_episodes(c.config, data, "rl_val")
@@ -610,3 +643,33 @@ def run_env(base_config: dict, ops: OpsConfig, env: str, start=None, end=None, f
         if missing:
             drops.make(base_config, env, missing)
     return [run_cycle(Cycle(base_config, ops, env, w), force) for w in todo]
+
+
+def carry_over(base_config: dict, ops: OpsConfig, source: str, target: str) -> dict[str, list[str]]:
+    """
+    Start environment ``target`` from ``source``'s champions (the live run from the final shadow
+    replay): its forecaster, keeping its fit date so the age clock carries on, and its policy with
+    the anchor version ahead of it, the fallback target. The versions serve the same logged models.
+    """
+    tracking.init_tracking(env_config(base_config, ops, target))
+    client, start = MlflowClient(), str(env_settings(ops, target).start)
+    for layer in registry.LAYERS:
+        if client.search_model_versions(f"name='{registry.model_name(target, layer)}'"):
+            raise RuntimeError(f"{registry.model_name(target, layer)} already has versions: carry-over starts an environment.")
+    out: dict[str, list[str]] = {}
+    for layer in registry.LAYERS:
+        src_name, dst_name = registry.model_name(source, layer), registry.model_name(target, layer)
+        champion = registry.resolve(src_name, registry.CHAMPION)
+        if champion is None:
+            raise RuntimeError(f"{src_name} has no champion to carry over.")
+        chain = [champion]
+        if layer == "policy" and champion.tags.get("kind") != "anchor":
+            anchors = [v for v in client.search_model_versions(f"name='{src_name}'") if v.tags.get("kind") == "anchor"]
+            chain = [min(anchors, key=lambda v: int(v.version)), champion]
+        out[layer] = []
+        for v in chain:
+            new = registry.copy_version(v, dst_name, {"trigger": "carry-over", "carried_from": f"{src_name} v{v.version}",
+                                                      "promoted_as_of": start})
+            registry.promote(dst_name, str(new.version))
+            out[layer].append(f"{dst_name} v{new.version} ← {src_name} v{v.version}")
+    return out

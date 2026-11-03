@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 
 from src.forecasting.measures import HORIZONS, Measure, parse_measures
-from src.forecasting.model import _BaseForecaster, inverse_values, transform_values
+from src.forecasting.model import SAVE_COMPRESSION, _BaseForecaster, inverse_values, transform_values
 from src.utils.metrics import quantile_loss
 
 MEAN_OBJECTIVES: tuple[str, ...] = ("poisson", "tweedie")
@@ -251,6 +251,7 @@ class EnsembleForecaster:
                 "calibration": dict(self.calibration),
             },
             path,
+            compress=SAVE_COMPRESSION,
         )
 
     @classmethod

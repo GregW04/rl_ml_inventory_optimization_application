@@ -11,7 +11,7 @@ State at the end of week D, one row per SKU:
 * ``transit_1`` — arrives at the start of D+1; ``transit_2`` arrives at the start of D+2
 * ``order``     — placed at the start of D+1 (decided in cycle D); it arrives at D+3
 
-Realising a week follows ``vn2.step_one_week`` exactly (tests/test_ops_ledger.py).
+Realising a week follows ``vn2.step_one_week`` exactly (tests/test_ops_units.py).
 """
 
 from __future__ import annotations
@@ -90,3 +90,21 @@ def anchor_orders(state: pd.DataFrame, forecasts: pd.DataFrame, anchor: LostSale
         for r in df.itertuples(index=False)
     ]
     return pd.Series(orders, index=state.index, dtype=float)
+
+
+def anchor_replay(state: pd.DataFrame, forecasts: dict[pd.Timestamp, pd.DataFrame],
+                  demand: dict[pd.Timestamp, pd.DataFrame], anchor: LostSalesAnchor, rules: VN2Rules) -> pd.DataFrame:
+    """
+    The anchor's trajectory from ``state`` (the end of the first cycle week; its order is decided
+    here): in every cycle week W of ``forecasts`` it orders with the forecasts issued in W, then
+    week W+1 is realised with ``demand[W+1]``. Returns the realised costs with their week.
+    """
+    state, costs = state.copy(), []
+    for week in sorted(forecasts):
+        nxt = week + pd.Timedelta(weeks=1)
+        if nxt not in demand:
+            break
+        state["order"] = anchor_orders(state, forecasts[week], anchor)
+        state, c = realise(state, demand[nxt], rules)
+        costs.append(c.assign(week=nxt))
+    return pd.concat(costs, ignore_index=True)

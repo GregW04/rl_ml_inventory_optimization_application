@@ -5,6 +5,11 @@ Command line of the ops loop (what the Airflow tasks call):
     python -m src.ops.cli drops release --env live --week 3     # publish VN2 file Week3
     python -m src.ops.cli step forecast --env dev --as-of 2023-10-09
     python -m src.ops.cli run --env dev [--start …] [--end …] [--force]   # all steps, week by week
+    python -m src.ops.cli tune --recipe champion --as-of 2022-10-03        # (re)tune a recipe
+    python -m src.ops.cli challenge --env live --recipe champion-2024      # a new recipe vs the champion
+    python -m src.ops.cli calibrate --env sim-never                        # drift-threshold tables
+    python -m src.ops.cli compare --envs sim-never sim-fixed13 --reference sim-fixed13
+    python -m src.ops.cli carry-over --from sim-final --to live            # go-live
 
 The tracking store comes from ``MLFLOW_TRACKING_URI`` (``make mlflow-server``) or the config.
 """
@@ -15,10 +20,12 @@ import argparse
 import warnings
 
 import pandas as pd
+import yaml
 
-from src.ops import drops
-from src.ops.settings import env_settings, load_ops_config, weeks
-from src.ops.steps import STEPS, Cycle, run_env, run_step
+from src.ops import calibrate, drops, retune
+from src.ops.settings import dump, env_settings, load_ops_config, weeks
+from src.ops.steps import STEPS, Cycle, carry_over, run_env, run_step
+from src.ops.tune import tune_recipe
 from src.utils.config import load_config
 
 # MLflow notes that don't apply here, kept out of every task log: the drops' integer columns never
@@ -56,6 +63,32 @@ def main(argv: list[str] | None = None) -> None:
     r.add_argument("--force", action="store_true",
                    help="re-run the latest finished week (earlier weeks need a fresh environment)")
 
+    t = sub.add_parser("tune", help="tune a recipe of configs/ops.yaml on the data known at a week")
+    t.add_argument("--recipe", required=True)
+    t.add_argument("--as-of", required=True)
+    t.add_argument("--trials", type=int, default=20, help="Optuna trials per backend (stops after 10 without gain)")
+    t.add_argument("--folds", type=int, default=2, help="the last CV folds before the fit cut")
+    t.add_argument("--fold-weeks", type=int, default=8)
+    t.add_argument("--min-train-weeks", type=int, default=52)
+
+    ch = sub.add_parser("challenge", help="score a new recipe against an environment's champion on its latest weeks")
+    ch.add_argument("--env", required=True)
+    ch.add_argument("--recipe", required=True)
+    ch.add_argument("--holdout-weeks", type=int, default=8)
+    ch.add_argument("--margin-pct", type=float, default=0.5, help="the € gain it needs, with the CI below 0")
+
+    cal = sub.add_parser("calibrate", help="threshold calibration tables from an environment's replay")
+    cal.add_argument("--env", required=True)
+    cal.add_argument("--paths", type=int, default=200, help="null paths per setting")
+
+    cmp_ = sub.add_parser("compare", help="refit strategies side by side: paired €, refits, compute")
+    cmp_.add_argument("--envs", nargs="+", required=True)
+    cmp_.add_argument("--reference", required=True)
+
+    co = sub.add_parser("carry-over", help="start an environment from another's champions (live from sim-final)")
+    co.add_argument("--from", dest="source", required=True)
+    co.add_argument("--to", dest="target", required=True)
+
     args = parser.parse_args(argv)
     config, ops = load_config(args.config), load_ops_config(args.ops_config)
     if args.project_root:
@@ -69,6 +102,20 @@ def main(argv: list[str] | None = None) -> None:
                 print(path)
     elif args.command == "step":
         run_step(Cycle(config, ops, args.env, pd.Timestamp(args.as_of)), args.name)
+    elif args.command == "carry-over":
+        for layer, lines in carry_over(config, ops, args.source, args.target).items():
+            print(layer, *lines, sep="\n  ")
+    elif args.command == "compare":
+        print(calibrate.strategy_report(config, ops, args.envs, args.reference).round(4).to_string())
+    elif args.command == "calibrate":
+        for name, table in calibrate.calibration_run(config, ops, args.env, args.paths).items():
+            print(f"\n{name}\n{table.to_string(index=False)}")
+    elif args.command == "challenge":
+        print(dump(retune.challenge(config, ops, args.env, args.recipe, args.holdout_weeks, args.margin_pct)))
+    elif args.command == "tune":
+        params = tune_recipe(config, ops, args.recipe, args.as_of, args.trials, args.folds, args.fold_weeks,
+                             args.min_train_weeks)
+        print(yaml.safe_dump({"model_params": params}, sort_keys=False))
     else:
         for week, status in zip(weeks(args.start or env_settings(ops, args.env).start, args.end or env_settings(ops, args.env).end),
                                 run_env(config, ops, args.env, args.start, args.end, args.force)):

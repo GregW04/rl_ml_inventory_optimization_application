@@ -18,7 +18,7 @@ from typing import Literal
 
 import pandas as pd
 import yaml
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from src.utils.config import get_project_root
 
@@ -39,6 +39,8 @@ class Bias(_Strict):
 
 
 class Coverage(_Strict):
+    # False: computed and logged every week, but never a reason to refit (a diagnostic).
+    trigger: bool = True
     window_weeks: int = 4
     band: tuple[float, float] = (0.79, 0.88)
     persistence_weeks: int = 2
@@ -95,20 +97,40 @@ class Rules(_Strict):
         return hashlib.sha256(self.model_dump_json().encode()).hexdigest()[:12]
 
 
+class RecipeSpec(_Strict):
+    """A forecaster recipe environments share: overrides of config["forecasting"] and hyperparameters."""
+
+    forecasting: dict = {}
+    # Per ensemble member, or the backend's own; None → the backends' defaults.
+    model_params: dict | None = None
+
+
 class Env(_Strict):
     kind: Literal["sim", "live"]
     start: date
     end: date
-    # Overrides of config["forecasting"] and the recipe's hyperparameters for this environment.
+    # A recipe from `recipes`; this environment's own forecasting / model_params override it.
+    recipe: str | None = None
     forecasting: dict = {}
     model_params: dict | None = None
     rules: dict = {}
 
 
 class OpsConfig(_Strict):
+    # Set after the shadow replay: `frozen: true` and the version of the rules it froze. A live
+    # environment runs only these rules (and only from a clean tree).
     frozen: bool = False
+    frozen_rules: str | None = None
     rules: Rules = Rules()
+    recipes: dict[str, RecipeSpec] = {}
     envs: dict[str, Env] = {}
+
+    @model_validator(mode="after")
+    def _known_recipes(self) -> OpsConfig:
+        unknown = {e: s.recipe for e, s in self.envs.items() if s.recipe and s.recipe not in self.recipes}
+        if unknown:
+            raise ValueError(f"Environments use undefined recipes: {unknown}")
+        return self
 
 
 def load_ops_config(path: str | Path | None = None) -> OpsConfig:
@@ -135,11 +157,31 @@ def env_rules(ops: OpsConfig, env: str) -> Rules:
     return Rules.model_validate(_merge(ops.rules.model_dump(), env_settings(ops, env).rules))
 
 
+def _recipe(ops: OpsConfig, env: str) -> RecipeSpec:
+    s = env_settings(ops, env)
+    return ops.recipes[s.recipe] if s.recipe else RecipeSpec()
+
+
 def env_config(config: dict, ops: OpsConfig, env: str) -> dict:
-    """The project config with the environment's forecasting overrides applied."""
+    """The project config with the environment's recipe and forecasting overrides applied."""
     cfg = copy.deepcopy(config)
-    cfg["forecasting"] = _merge(cfg["forecasting"], env_settings(ops, env).forecasting)
+    cfg["forecasting"] = _merge(_merge(cfg["forecasting"], _recipe(ops, env).forecasting), env_settings(ops, env).forecasting)
     return cfg
+
+
+def recipe_config(config: dict, ops: OpsConfig, name: str) -> dict:
+    """The project config with recipe ``name``'s forecasting overrides applied."""
+    if name not in ops.recipes:
+        raise KeyError(f"Unknown recipe '{name}'; configs/ops.yaml defines {sorted(ops.recipes)}.")
+    cfg = copy.deepcopy(config)
+    cfg["forecasting"] = _merge(cfg["forecasting"], ops.recipes[name].forecasting)
+    return cfg
+
+
+def env_model_params(ops: OpsConfig, env: str) -> dict | None:
+    """The hyperparameters a bootstrap fits with: the environment's own, else its recipe's."""
+    own = env_settings(ops, env).model_params
+    return own if own is not None else _recipe(ops, env).model_params
 
 
 def env_dir(config: dict, env: str) -> Path:

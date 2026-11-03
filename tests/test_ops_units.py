@@ -313,3 +313,169 @@ def test_a_week_has_one_timestamp_unit_however_it_arrives():
     frames = [pd.DataFrame({"x": [1.0]}).assign(week=c.as_of) for c in (from_cli, from_loop)]
     pd.testing.assert_frame_equal(*frames)
     assert frames[0]["week"].dtype == "datetime64[ns]"
+
+
+# ---------------------------------------------------------------------------
+# Calibration (the decision rule replayed on weekly series)
+# ---------------------------------------------------------------------------
+
+def _weekly(n_weeks: int, shift_from: int | None = None, shift: float = 0.0, seed: int = 0):
+    rng = np.random.default_rng(seed)
+    weeks = pd.date_range("2022-10-10", periods=n_weeks, freq="7D")
+    errors = pd.DataFrame({c: rng.normal(0, 0.04, n_weeks) for c in ("Smooth", "Lumpy")}, index=weeks)
+    if shift_from is not None:
+        errors.iloc[shift_from:] += shift
+    counts = pd.DataFrame(300.0, index=weeks, columns=["Smooth", "Lumpy"])
+    hits = pd.DataFrame(rng.binomial(300, 0.833, (n_weeks, 2)).astype(float), index=weeks, columns=["Smooth", "Lumpy"])
+    # As in a ledger: q83_h2 is scored from two weeks after the first mean_h0 error.
+    return errors, hits.iloc[2:], counts.iloc[2:]
+
+
+def test_the_drift_rule_refits_after_a_level_shift_and_restarts_its_signal():
+    from src.ops import calibrate
+
+    rules = Rules(strategy="drift")
+    share = {"Smooth": 0.5, "Lumpy": 0.5}
+    # Pure noise: a strict limit never fires (the first values do now and then: what calibration sets).
+    assert calibrate.simulate_refits(*_weekly(60), share, Rules(strategy="drift", bias={"limit": 0.95})) == []
+    refits = calibrate.simulate_refits(*_weekly(60, shift_from=30, shift=0.3), share, rules)
+    # Warm-up (4 errors) and persistence (2 weeks) bound the delay after the shift…
+    assert 30 <= [r for r in refits if r >= 30][0] <= 36
+    # …and a refit restarts the signal: the next one needs a new warm-up and streak.
+    assert all(b - a >= rules.bias.warmup_weeks + rules.bias.persistence_weeks - 1 for a, b in zip(refits, refits[1:]))
+    # Classes below the cost-share gate never trigger.
+    assert calibrate.simulate_refits(*_weekly(60, shift_from=30, shift=0.3), {"Smooth": 0.1, "Lumpy": 0.1}, rules) == []
+
+
+def test_false_refits_fall_with_the_limit():
+    from src.ops import calibrate
+
+    errors, hits, counts = _weekly(80, seed=3)
+    share = {"Smooth": 0.5, "Lumpy": 0.5}
+    rate = {limit: calibrate.false_refits_per_26_weeks(errors, hits, counts, share, Rules(strategy="drift", bias={"limit": limit}),
+                                                       n_paths=30, length=52)
+            for limit in (0.3, 0.74, 0.99)}
+    assert rate[0.3] > rate[0.74] >= rate[0.99] and rate[0.99] < 0.1
+
+
+def test_strategy_comparison_pairs_sku_weeks_and_leaves_out_censored_ones():
+    from src.ops import calibrate
+
+    rng = np.random.default_rng(0)
+    weeks = pd.date_range("2023-01-02", periods=40, freq="7D")
+    base = pd.DataFrame([(s, 1, w) for s in range(50) for w in weeks], columns=["store", "product", "week"])
+    a = base.assign(cost_eur=rng.gamma(2, 1, len(base)), censored=False)
+    b = a.assign(cost_eur=a["cost_eur"] * 1.02)
+    b.loc[b.index[:30], "censored"] = True  # out of stock in b: left out of both
+    b.loc[b.index[:30], "cost_eur"] = 1e6
+    out = calibrate.compare_strategies({"a": a, "b": b}, reference="a")
+    assert out.loc["a", "vs_reference_pct"] == 0.0
+    assert out.loc["b", "vs_reference_pct"] == pytest.approx(2.0) and out.loc["b", "ci_lo"] == pytest.approx(2.0)
+
+
+# ---------------------------------------------------------------------------
+# Retune (an operator's challenge)
+# ---------------------------------------------------------------------------
+
+def test_a_forecast_changes_costs_only_once_its_order_arrives():
+    anchor = LostSalesAnchor(AnchorSpec("mean_h0", "mean_h1", "q83_h2", ("q83_h2",), 0.8333), RULES)
+    weeks_ = pd.date_range("2023-01-02", periods=6, freq="7D")
+    state = pd.DataFrame({"store": [1], "product": [1], "on_hand": [5.0], "transit_1": [2.0], "transit_2": [2.0], "order": [np.nan]})
+    demand = {w: pd.DataFrame({"store": [1], "product": [1], "demand": [3.0], "censored": [False]}) for w in weeks_[1:]}
+    low = {w: pd.DataFrame({"store": [1], "product": [1], "mean_h0": [3.0], "mean_h1": [3.0], "q83_h2": [6.0]}) for w in weeks_[:-1]}
+    high = {w: f.assign(q83_h2=12.0) for w, f in low.items()}
+    a, b = (ledger.anchor_replay(state, f, demand, anchor, RULES).set_index("week")["cost_eur"] for f in (low, high))
+    # Cycle A's order arrives at A+3: weeks A+1 and A+2 can't differ, A+3 does (more stock, more holding).
+    assert (a.iloc[:2] == b.iloc[:2]).all() and b.iloc[2] > a.iloc[2]
+
+
+def test_a_won_challenge_is_a_retune_unless_the_champion_must_roll_back():
+    rules = Rules()
+    champion = {"version": "2", "fit_as_of": "2023-01-02", "promoted_as_of": "2023-01-02", "age_weeks": 3,
+                "weeks_since_promotion": 3}
+    pending = {"recipe": "r2", "delta_pct": -1.2, "ci_lo": -2.0, "ci_hi": -0.4, "as_of": "2023-01-16", "run_id": "abc"}
+    d = decide({"champion": champion, "pending_recipe": pending}, rules)
+    assert d.action == "retune" and "r2" in d.reasons[0]
+    probation = {"evidence_weeks": 4, "delta_pct": 3.0, "ci_lo": 1.0, "ci_hi": 5.0}
+    assert decide({"champion": champion, "pending_recipe": pending, "probation": probation}, rules).action == "rollback"
+
+
+def test_coverage_profile_finds_no_extra_spread_in_independent_hits():
+    from src.ops import calibrate
+
+    _, hits, counts = _weekly(120, seed=5)
+    prof = calibrate.coverage_profile(hits, counts, window_weeks=4)
+    assert prof["coverage"].between(0.81, 0.86).all()
+    # Independent SKU-weeks: the window coverage spreads like a binomial (design effect ≈ 1).
+    assert prof["design_effect"].between(0.4, 2.0).all()
+
+
+def test_threshold_grid_reports_a_rate_and_a_first_refit_per_setting():
+    from src.ops import calibrate
+
+    errors, hits, counts = _weekly(70, shift_from=40, shift=0.3, seed=1)
+    grid = calibrate.threshold_grid(errors, hits, counts, {"Smooth": 0.5, "Lumpy": 0.5}, Rules(), limits=(0.6, 0.9),
+                                    persistences=(2,), half_widths=(0.05,), n_paths=10, length=52)
+    bias, cov = grid["bias"], grid["coverage"]
+    assert len(bias) == 2 and len(cov) == 1
+    # A stricter limit fires less on null paths, and the level shift is caught either way.
+    assert bias.loc[0, "false_refits_per_26w"] >= bias.loc[1, "false_refits_per_26w"]
+    assert all(pd.Timestamp(d) >= errors.index[30] for d in bias["first_refit"].dropna())
+
+
+def test_live_runs_only_frozen_rules(tmp_path, monkeypatch):
+    from src.utils import tracking
+
+    config = load_config()
+    config["_project_root"] = str(tmp_path)
+    live = {"kind": "live", "start": "2024-04-08", "end": "2024-06-03"}
+    monkeypatch.setattr(tracking, "git_state", lambda: ("abc", False))
+    with pytest.raises(RuntimeError, match="aren't the frozen ones"):
+        steps.step_ingest(steps.Cycle(config, OpsConfig.model_validate({"envs": {"live": live}}), "live", pd.Timestamp("2024-04-08")))
+    frozen = OpsConfig.model_validate({"frozen": True, "frozen_rules": Rules().version(), "envs": {"live": live}})
+    monkeypatch.setattr(tracking, "git_state", lambda: ("abc", True))
+    with pytest.raises(RuntimeError, match="uncommitted changes"):
+        steps.step_ingest(steps.Cycle(config, frozen, "live", pd.Timestamp("2024-04-08")))
+    monkeypatch.setattr(tracking, "git_state", lambda: ("abc", False))
+    with pytest.raises(FileNotFoundError):  # past the guard: there is no drop yet
+        steps.step_ingest(steps.Cycle(config, frozen, "live", pd.Timestamp("2024-04-08")))
+
+
+def test_coverage_as_a_diagnostic_never_refits():
+    champion = {"version": "1", "fit_as_of": "2023-01-02", "promoted_as_of": "2023-01-02", "age_weeks": 8,
+                "weeks_since_promotion": 8}
+    signals = {"champion": champion, "cost_share": {"Smooth": 0.6},
+               "coverage": {"Smooth": {"weeks": 8, "value": 0.70, "streak": 3}}}
+    assert decide(signals, Rules(strategy="drift")).action == "refit"
+    assert decide(signals, Rules(strategy="drift", coverage={"trigger": False})).action == "keep"
+
+
+def test_carry_over_starts_an_environment_from_another_ones_champions(tmp_path):
+    config = load_config()
+    config["_project_root"] = str(tmp_path)
+    env = {"kind": "sim", "start": "2023-01-02", "end": "2023-06-26"}
+    ops = OpsConfig.model_validate({"envs": {"src": env, "dst": {**env, "start": "2023-07-03", "end": "2023-09-25"}}})
+
+    def version(name: str, tags: dict) -> str:
+        with mlflow.start_run():
+            info = mlflow.pyfunc.log_model(name="m", python_model=_Echo())
+        return str(registry.register(info.model_uri, name, tags).version)
+
+    fc, pol = registry.model_name("src", "forecaster"), registry.model_name("src", "policy")
+    registry.promote(fc, version(fc, {"as_of": "2023-04-03", "recipe_key": "abc"}))
+    anchor = version(pol, {"kind": "anchor", "as_of": "2023-01-02"})
+    registry.promote(pol, anchor)
+    registry.promote(pol, version(pol, {"kind": "ppo", "as_of": "2023-06-19", "gate": '["Lumpy"]'}))
+
+    out = steps.carry_over(config, ops, "src", "dst")
+    dst_fc = registry.resolve(registry.model_name("dst", "forecaster"), registry.CHAMPION)
+    src_fc = registry.resolve(fc, registry.CHAMPION)
+    # The same logged model, its fit date kept (the age clock carries on), promoted at the new start.
+    assert dst_fc.source == src_fc.source and dst_fc.tags["as_of"] == "2023-04-03"
+    assert dst_fc.tags["trigger"] == "carry-over" and dst_fc.tags["promoted_as_of"] == "2023-07-03"
+    dst_pol = registry.model_name("dst", "policy")
+    champion, previous = (registry.resolve(dst_pol, a) for a in (registry.CHAMPION, registry.PREVIOUS))
+    assert champion.tags["kind"] == "ppo" and previous.tags["kind"] == "anchor"  # the fallback target is there
+    assert len(out["policy"]) == 2
+    with pytest.raises(RuntimeError, match="already has versions"):
+        steps.carry_over(config, ops, "src", "dst")
