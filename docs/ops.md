@@ -331,7 +331,21 @@ identical demand, so their costs pair on the same in-stock SKU-weeks. The CI is 
 - **What the drift alarms did.** They caught the real shifts, for example 2023-10-16 (Intermittent −0.99,
   Lumpy −0.87, the start of the decline). But refitting on them didn't beat a steady 13-week rhythm.
 - **What stays on.** The monitors keep running as logged signals (`bias_ts_*` and `coverage_q83_*` on the
-  timeline run); only the trigger is age.
+  timeline run), and the drift alarm is recorded in every cycle as an alert; only the trigger is age.
+- **The drift alert.** Every cycle records the bias alarm that the drift strategies refit on, under any
+  strategy: `decision.json` has `drift_alarm` (`active`, `severe`, `reasons`), the cycle run has the tags
+  `drift_alarm` and `drift_alarm_reasons`, and the timeline has the metric `drift_alarm` (0 or 1 per week).
+  - **Same detector, no action.** It is the refit trigger's own function: the Trigg signal past ±0.74 for 2
+    weeks in a class with at least 15% of the cost, severe above 0.9. It has no cooldown, which only delays a
+    refit. Under `fixed` it changes nothing: `decide` is untouched and the rules version is still
+    `03f2617e8ceb`.
+  - **Not in the finished runs.** Their files carry no alert. Applied afterwards to their stored signals, it
+    gives 24 alert weeks in `sim-final`, in 6 episodes of 1 to 9 weeks: without a refit, an alarm lasts until
+    the bias fades or the schedule refits. On `sim-drift` and `sim-drift-backstop` it matches every refit the
+    drift rule took (158 weeks, no mismatch).
+  - **The live run shows none, and couldn't.** The signal counts from a champion's 4th week and needs 2 weeks
+    past the limit. The first live forecaster was replaced after 4 weeks and the second had 4 by the end. The
+    closest value was Intermittent −0.72 on 2024-05-06, against the limit 0.74.
 - **What was deleted.** After the comparison, the model files and registered models of `sim-never`, `sim-drift`
   and `sim-drift-backstop` were removed (24 models, 7.05 GB). Their runs, metrics and ledgers remain, and the
   models refit bit for bit from the recipe and the drops. `sim-fixed13` and `sim-final` keep theirs.

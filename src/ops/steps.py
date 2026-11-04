@@ -44,7 +44,7 @@ from src.forecasting.model import build_feature_matrix
 from src.forecasting.preprocessing import build_target_columns, load_master, load_sales_panel
 from src.forecasting.recipe import PANEL_COLUMNS, Recipe, fit_recipe, forecast, panel_digest
 from src.ops import contract, drops, ledger, monitor, registry, retune, rl
-from src.ops.decide import Decision, decide, decide_policy
+from src.ops.decide import Decision, decide, decide_policy, drift_alert
 from src.ops.settings import (
     Env,
     OpsConfig,
@@ -392,7 +392,8 @@ def step_monitor(c: Cycle) -> None:
 
 def step_decide(c: Cycle) -> None:
     signals = c.read("signals.json")
-    c.write("decision.json", {**decide(signals, c.rules).to_dict(), "policy": decide_policy(signals, c.rules).to_dict()})
+    c.write("decision.json", {**decide(signals, c.rules).to_dict(), "policy": decide_policy(signals, c.rules).to_dict(),
+                              "drift_alarm": drift_alert(signals, c.rules)})
 
 
 def step_refit(c: Cycle) -> None:
@@ -581,6 +582,7 @@ def step_report(c: Cycle) -> None:
     for cls, v in signals.get("coverage", {}).items():
         if v["value"] is not None:
             metrics[f"coverage_q83_{cls}"] = v["value"]
+    metrics["drift_alarm"] = float(decision["drift_alarm"]["active"])
     if (p := signals.get("probation")) and p.get("evidence_weeks"):
         metrics["probation_delta_pct"] = p["delta_pct"]
     for k, v in signals.get("diagnostics", {}).items():
@@ -593,6 +595,8 @@ def step_report(c: Cycle) -> None:
     tags = {"decision": decision["action"], "decision_reasons": "; ".join(decision["reasons"])[:500],
             "policy_decision": decision["policy"]["action"],
             "policy_reasons": "; ".join(decision["policy"]["reasons"])[:500],
+            "drift_alarm": str(decision["drift_alarm"]["active"]).lower(),
+            "drift_alarm_reasons": "; ".join(decision["drift_alarm"]["reasons"])[:500],
             "policy_version": "" if policy is None else str(policy.version),
             "policy_kind": "" if policy is None else policy.tags.get("kind", ""),
             "champion_version": "" if champion is None else str(champion.version),

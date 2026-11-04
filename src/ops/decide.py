@@ -13,6 +13,9 @@ It reads and writes nothing, so every branch is unit-tested (tests/test_ops_unit
    → **refit** (same recipe)
 6. otherwise → **keep**. Input-side diagnostics alone never retrain.
 
+Under every strategy the cycle also records the drift alarm (``drift_alert``) next to the decision.
+Only the strategies above act on it; under ``fixed`` and ``never`` it is an alert and nothing more.
+
 The policy layer decides separately (``decide_policy``):
 
 1. no policy yet → **bootstrap** (the anchor, version 1)
@@ -57,6 +60,12 @@ def drift_alarms(signals: dict, rules: Rules) -> tuple[list[str], bool]:
             lo, hi = rules.coverage.band
             reasons.append(f"coverage {cls}: {c['value']:.3f} outside [{lo}, {hi}] for {c['streak']} weeks")
     return reasons, severe
+
+
+def drift_alert(signals: dict, rules: Rules) -> dict:
+    """The drift alarm as every cycle records it, whatever the strategy: an alert for the operator, never an action."""
+    reasons, severe = drift_alarms(signals, rules)
+    return {"active": bool(reasons), "severe": severe, "reasons": reasons}
 
 
 def decide(signals: dict, rules: Rules) -> Decision:

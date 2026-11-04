@@ -55,6 +55,13 @@ def test_environment_bootstraps_refits_promotes_and_replays(tmp_path):
     assert stages == sorted(["timeline"] + ["cycle"] * 6 + ["bootstrap", "refit", "refit", "policy-bootstrap"])
     assert not client.search_runs([mlflow.get_experiment_by_name("Default").experiment_id])  # nothing leaks there
     assert all(r.info.status == "FINISHED" for r in runs)
+    # Every cycle records the drift alarm, which under strategy fixed is an alert and never an action.
+    cycles = [r for r in runs if r.data.tags["stage"] == "cycle"]
+    assert {r.data.tags["drift_alarm"] for r in cycles} == {"false"}
+    assert all(r.data.metrics["drift_alarm"] == 0.0 and r.data.tags["drift_alarm_reasons"] == "" for r in cycles)
+    quiet = {"active": False, "severe": False, "reasons": []}
+    assert all(pd.read_json(cycle_dir(config, "a", w) / "decision.json", typ="series")["drift_alarm"] == quiet
+               for w in weeks(ENV["start"], ENV["end"]))
 
     assert run_env(config, ops, "a") == ["skipped"] * 6
 

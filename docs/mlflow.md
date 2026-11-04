@@ -207,12 +207,15 @@ orders = policy.predict(decision_frame)   # src.ops.rl.decision_frame(state, for
   - **Tags:**
     - `as_of`, `env`, `rules_version` (hash of the effective rules), `strategy`;
     - the decisions: `decision`, `decision_reasons`, `policy_decision`, `policy_reasons`;
+    - the drift alert (under any strategy; it never acts under `fixed`): `drift_alarm` (`true` or `false`) and
+      `drift_alarm_reasons`;
     - what served: `champion_version`, `previous_version`, `policy_version`, `policy_kind`;
     - the provenance tags.
   - **Metrics:**
     - per trajectory: `<trajectory>_{cost,holding,shortage}_eur_per_sku` and `<trajectory>_censored_share`;
     - `live_units_ordered`, `rl_share_of_skus` and `champion_age_weeks`;
-    - the monitors: `bias_ts_<class>`, `coverage_q83_<class>`, `probation_delta_pct` and `diag_*`.
+    - the monitors: `bias_ts_<class>`, `coverage_q83_<class>`, `drift_alarm` (0 or 1), `probation_delta_pct`
+      and `diag_*`.
   - **Input:** the week's drop (context `weekly_drop`).
   - **Artifacts:** `cycle/`, a copy of the cycle folder.
 - **Children of a cycle run:**

@@ -14,7 +14,7 @@ import pytest
 from src.forecasting.drift import trigg_signal
 from src.forecasting.preprocessing import load_master
 from src.ops import contract, drops, ledger, monitor, registry, steps
-from src.ops.decide import decide
+from src.ops.decide import decide, drift_alert
 from src.ops.settings import OpsConfig, Rules
 from src.simulation.anchor import AnchorSpec, LostSalesAnchor
 from src.simulation.vn2 import InventoryState, VN2Rules, step_one_week
@@ -140,6 +140,20 @@ SMALL_ALARM = {"Lumpy": {"ts": 0.95, "streak": 3, "severe": True}}
 ])
 def test_decision_table(strategy, signals, action):
     assert decide(signals, Rules(strategy=strategy)).action == action
+
+
+@pytest.mark.parametrize("strategy", ["never", "fixed", "drift", "drift_backstop"])
+def test_drift_alert_is_recorded_under_every_strategy_and_only_the_drift_strategies_act_on_it(strategy):
+    rules = Rules(strategy=strategy)
+    alert = drift_alert(_signals(age=6, bias=ALARM), rules)
+    assert alert["active"] and not alert["severe"] and alert["reasons"][0].startswith("bias Smooth: tracking signal +0.80")
+    assert decide(_signals(age=6, bias=ALARM), rules).action == ("refit" if strategy in ("drift", "drift_backstop") else "keep")
+    assert drift_alert(_signals(age=6, bias={"Smooth": {"ts": 0.95, "streak": 2, "severe": True}}), rules)["severe"]
+    # The same gates as the refit trigger: a class under 15% of the cost, or a streak under 2 weeks, is no alert.
+    quiet = {"active": False, "severe": False, "reasons": []}
+    assert drift_alert(_signals(bias=SMALL_ALARM), rules) == quiet
+    assert drift_alert(_signals(bias={"Smooth": {"ts": 0.8, "streak": 1, "severe": False}}), rules) == quiet
+    assert drift_alert({}, rules) == quiet  # no champion yet
 
 
 # ---------------------------------------------------------------------------
