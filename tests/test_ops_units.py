@@ -546,3 +546,18 @@ def test_the_trend_diagnostic_sees_a_level_shift_through_the_season():
     assert abs(flat) < 2.0 and 20.0 < shifted < 40.0  # the season alone moves nothing; a +30% level shows
     young = panel()[lambda df: df["date"] <= weeks_[100]]  # under two years of history: nothing
     assert monitor.trend_changes(young, classes.assign(date=weeks_[100]), weeks_[100]) == {}
+
+
+def test_bias_series_is_bias_state_week_by_week():
+    rng = np.random.default_rng(3)
+    rules = Rules()
+    errors = np.concatenate([rng.normal(0, 0.1, 15), rng.normal(0.25, 0.1, 15)])  # a shift from week 16
+    series = monitor.bias_series(errors, rules)
+    for i in range(len(errors)):
+        state = monitor.bias_state(errors[: i + 1], rules)
+        row = series.iloc[i]
+        assert state["streak"] == row["streak"] and state["severe"] == row["severe"]
+        assert (state["ts"] is None) == np.isnan(row["ts"]) and (state["ts"] is None or state["ts"] == row["ts"])
+        assert row["alert"] == (row["streak"] >= rules.bias.persistence_weeks)
+    assert series["alert"].iloc[20:].any() and not series["alert"].iloc[:10].any()
+    assert monitor.bias_state(np.array([]), rules) == {"weeks": 0, "ts": None, "streak": 0, "severe": False}

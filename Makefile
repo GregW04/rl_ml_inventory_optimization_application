@@ -6,6 +6,7 @@ ROOT := $(abspath .)
 VENV := $(ROOT)/.venv/bin
 MLFLOW_PORT ?= 5050
 MLFLOW_URI := http://127.0.0.1:$(MLFLOW_PORT)
+APP_PORT ?= 8501
 LOGS := $(ROOT)/artifacts/logs
 # Airflow lives in its own venv and home; its tasks run the project's CLI with $(VENV)/python.
 AIRFLOW_VERSION := 3.3.2
@@ -40,10 +41,13 @@ mlflow-server: ## start the tracking server (SQLite backend, proxied artifacts) 
 mlflow-stop: ## stop the tracking server
 	@pkill -TERM -f "mlflow server --backend-store-uri sqlite:///$(ROOT)/mlruns.db" && echo "stopped" || echo "not running"
 
-app: mlflow-server ## start the Streamlit app against the tracking server
+# A running app keeps the src/ and app/lib.py it imported at start, so `make app` replaces it
+# instead of starting a second copy on the next port. Restart it after changing the code.
+app: mlflow-server ## (re)start the Streamlit app against the tracking server on port $(APP_PORT)
+	@pkill -TERM -f "streamlit run app/Home.py" && echo "stopped the running app" && sleep 2 || true
 	@MLFLOW_TRACKING_URI=$(MLFLOW_URI) nohup $(VENV)/streamlit run app/Home.py --server.headless true \
-	  > $(LOGS)/streamlit.log 2>&1 &
-	@echo "Streamlit at http://localhost:8501 (log: $(LOGS)/streamlit.log)"
+	  --server.port $(APP_PORT) > $(LOGS)/streamlit.log 2>&1 &
+	@echo "Streamlit at http://localhost:$(APP_PORT) (log: $(LOGS)/streamlit.log)"
 
 app-stop: ## stop the Streamlit app
 	@pkill -TERM -f "streamlit run app/Home.py" && echo "stopped" || echo "not running"

@@ -61,12 +61,12 @@ def _scored(forecasts: pd.DataFrame, actuals: pd.DataFrame, column: str, horizon
     return out[out["sales"].notna()]
 
 
-def weekly_errors(forecasts: pd.DataFrame, actuals: pd.DataFrame) -> pd.DataFrame:
-    """Week × class relative error of ``mean_h0``: Σ(sales − forecast) / Σ forecast over in-stock SKU-weeks."""
-    scored = _scored(forecasts, actuals, "mean_h0", 0)
-    weekly = scored.groupby(["week", "demand_class"])[["sales", "mean_h0"]].sum()
-    weekly = weekly[weekly["mean_h0"] > 0]
-    return ((weekly["sales"] - weekly["mean_h0"]) / weekly["mean_h0"]).unstack("demand_class").sort_index()
+def weekly_errors(forecasts: pd.DataFrame, actuals: pd.DataFrame, column: str = "mean_h0") -> pd.DataFrame:
+    """Week × class relative error of an h0 ``column``: Σ(sales − forecast) / Σ forecast over in-stock SKU-weeks."""
+    scored = _scored(forecasts, actuals, column, 0)
+    weekly = scored.groupby(["week", "demand_class"])[["sales", column]].sum()
+    weekly = weekly[weekly[column] > 0]
+    return ((weekly["sales"] - weekly[column]) / weekly[column]).unstack("demand_class").sort_index()
 
 
 def weekly_hits(forecasts: pd.DataFrame, actuals: pd.DataFrame, column: str = "q83_h2") -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -77,15 +77,37 @@ def weekly_hits(forecasts: pd.DataFrame, actuals: pd.DataFrame, column: str = "q
     return weekly["sum"].unstack("demand_class").sort_index(), weekly["count"].unstack("demand_class").sort_index()
 
 
+def _bias_arrays(errors: np.ndarray, rules: Rules) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per week: the tracking signal (NaN before the warm-up ends), weeks in a row past the limit, severity."""
+    ts = trigg_signal(errors, rules.bias.alpha)
+    counted = np.arange(len(ts)) >= rules.bias.warmup_weeks - 1
+    streak = np.zeros(len(ts), dtype=int)
+    run = 0
+    for i, (c, v) in enumerate(zip(counted, ts)):
+        run = run + 1 if c and abs(v) > rules.bias.limit else 0
+        streak[i] = run
+    return np.where(counted, ts, np.nan), streak, counted & (np.abs(ts) > rules.bias.severe_limit)
+
+
+def bias_series(errors: np.ndarray, rules: Rules) -> pd.DataFrame:
+    """
+    One class's bias monitor week by week, as :func:`bias_state` would report it after each week:
+    ``ts``, ``streak``, ``alert`` (past the limit for ``persistence_weeks`` in a row; the drift
+    alarm before any cost-share or cooldown rule) and ``severe``.
+    """
+    ts, streak, severe = _bias_arrays(errors, rules)
+    return pd.DataFrame({"ts": ts, "streak": streak, "alert": streak >= rules.bias.persistence_weeks, "severe": severe})
+
+
 def bias_state(errors: np.ndarray, rules: Rules) -> dict:
     """One class's tracking signal since promotion: latest value, weeks in a row past the limit, severity."""
-    ts = trigg_signal(errors, rules.bias.alpha)
-    counted = ts[rules.bias.warmup_weeks - 1:] if len(ts) >= rules.bias.warmup_weeks else np.array([])
+    ts, streak, severe = _bias_arrays(errors, rules)
+    last = len(ts) - 1
     return {
         "weeks": int(len(errors)),
-        "ts": float(counted[-1]) if len(counted) else None,
-        "streak": _streak([abs(v) > rules.bias.limit for v in counted]),
-        "severe": bool(len(counted) and abs(counted[-1]) > rules.bias.severe_limit),
+        "ts": float(ts[last]) if last >= 0 and not np.isnan(ts[last]) else None,
+        "streak": int(streak[last]) if last >= 0 else 0,
+        "severe": bool(last >= 0 and severe[last]),
     }
 
 
