@@ -1,4 +1,4 @@
-"""Forecast drift diagnostics: per-fit bias, block-end rule, hidden test block, tracking signal."""
+"""Forecast drift diagnostics: per-fit bias, block-end rule, hidden test block, tracking signal, alerts."""
 
 from __future__ import annotations
 
@@ -108,12 +108,73 @@ def test_tracking_signal_flags_persistent_bias_not_noise():
     assert np.any(t[10:] > TRIGG_LIMIT)
 
 
-def test_weekly_bias_and_alarm():
+def test_weekly_bias():
     fc, sales = _data({"rl_train": 0.8, "rl_val": 0.8, "rl_test": 1.0})
     w = weekly_bias(fc, sales, _resolved(), MEAN0)
     assert w["bias_pct"].round(6).eq(20.0).all()
     assert set(w["block"]) == {"training", "validation"}
-    # A constant error drives the signal toward 1 (1 − 0.8^(t+1)); it alarms once past the limit and stays.
-    first = int(np.flatnonzero(w["alarm"].to_numpy())[0])
-    assert first >= 4 and w["alarm"].iloc[first:].all()
-    assert w["tracking_signal"].iloc[-1] > 0.95
+    assert list(w.columns) == ["date", "block", "fit", "bias_pct"]
+
+
+# ---------------------------------------------------------------------------
+# Drift alerts: the production bias alarm on a run's fits
+# ---------------------------------------------------------------------------
+
+def _class_actuals(sales: pd.DataFrame) -> pd.DataFrame:
+    """Store 0 Smooth, store 1 Lumpy (the same volume: no size filter), plus an Unclassified SKU."""
+    extra = sales[sales["store"] == 0].assign(store=2)
+    act = pd.concat([sales, extra], ignore_index=True)
+    return act.assign(demand_class=act["store"].map({0: "Smooth", 1: "Lumpy", 2: "Unclassified"}))
+
+
+def test_drift_alerts_restart_at_each_refit():
+    from src.forecasting.drift_alerts import alert_weeks, earliest_alert_week, fit_alerts
+    from src.ops.settings import Rules
+
+    # 20% too low everywhere but the test block: (10 − 8) / 8 = +25% a week. From a restart the
+    # signal is 1 − 0.8^k: past 0.74 from a fit's week 7, so an alert (2 weeks in a row) needs week 8.
+    fc, sales = _data({"rl_train": 0.8, "rl_val": 0.8, "rl_test": 1.0})
+    fc = pd.concat([fc, fc[fc["store"] == 0].assign(store=2)], ignore_index=True)
+    rules = Rules()
+    a = fit_alerts(fc, _class_actuals(sales), _resolved(), "mean_h0", rules)
+    assert set(a["demand_class"]) == {"Smooth", "Lumpy"}  # Unclassified is left out
+    assert a["error_pct"].round(6).isin([25.0, 0.0]).all()
+    # Each 7-week training fit restarts before it can alert; a pooled signal would have alerted.
+    assert alert_weeks(a, "rl_train") == 0 and a.loc[a["block"] == "rl_train", "streak"].max() == 1
+    hits = a[a["alert"]]
+    assert set(hits["block"]) == {"rl_val"} and set(hits["week_of_fit"]) == {8}
+    assert set(hits["demand_class"]) == {"Smooth", "Lumpy"}
+    assert hits["week_of_fit"].min() >= earliest_alert_week(rules)
+    assert alert_weeks(a, "rl_val") == 1 and alert_weeks(a, "rl_test") == 0
+    # The warm-up: no signal before a fit's 4th week.
+    assert a.loc[a["week_of_fit"] < rules.bias.warmup_weeks, "tracking_signal"].isna().all()
+
+
+def test_drift_alert_summary():
+    from src.forecasting.drift_alerts import alert_summary, fit_alerts
+    from src.ops.settings import Rules
+
+    fc, sales = _data({"rl_train": 0.8, "rl_val": 0.8, "rl_test": 1.0})
+    s = alert_summary(fit_alerts(fc, _class_actuals(sales), _resolved(), "mean_h0", Rules())).set_index(["block", "demand_class"])
+    assert s.loc[("rl_val", "Smooth"), "alert_weeks"] == 1
+    assert s.loc[("rl_val", "Smooth"), "first_alert"] == VAL[1]
+    assert pd.isna(s.loc[("rl_train", "Smooth"), "first_alert"])
+
+
+def test_first_alert_marks_keep_each_classs_first_alert_in_each_fit():
+    from src.forecasting.drift_alerts import first_alert_marks
+
+    alerts = pd.DataFrame({
+        "block": "rl_train", "fit": ["training 1/2"] * 4 + ["training 2/2"] * 3,
+        "week": pd.to_datetime(["2023-10-02", "2023-10-09", "2023-10-09", "2023-10-16", "2023-11-06", "2023-11-13", "2023-11-20"]),
+        "demand_class": ["Lumpy", "Lumpy", "Smooth", "Lumpy", "Smooth", "Smooth", "Lumpy"],
+        "alert": [True, True, True, True, True, True, False]})
+    marks = first_alert_marks(alerts)
+    # Lumpy first alerts on 10-02 and Smooth on 10-09 in fit 1; their later alert weeks are not marked; fit 2: Smooth only.
+    assert marks[["fit", "week", "classes"]].values.tolist() == [
+        ["training 1/2", pd.Timestamp("2023-10-02"), "Lumpy"], ["training 1/2", pd.Timestamp("2023-10-09"), "Smooth"],
+        ["training 2/2", pd.Timestamp("2023-11-06"), "Smooth"]]
+    both = first_alert_marks(alerts.assign(week=pd.Timestamp("2023-10-02"), fit="training 1/2").iloc[:3])
+    assert both["classes"].tolist() == ["Lumpy, Smooth"]  # classes alerting first in the same week share a mark
+    assert first_alert_marks(alerts.assign(alert=False)).empty and first_alert_marks(alerts.iloc[:0]).empty
+

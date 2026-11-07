@@ -102,3 +102,33 @@ def test_saved_record_and_fallback_counts():
     assert rec["refit_every_weeks"] == 13 and len(rec["block_fits"]) == 6
     assert block_fit_counts(rec) == {"rl_train": 4, "rl_val": 1, "rl_test": 1}
     assert block_fit_counts({"refit_per_block": True}) == {"rl_train": 1, "rl_val": 1, "rl_test": 1}
+
+
+def test_refit_events_list_every_fit_with_the_data_it_saw():
+    from src.forecasting.periods import refit_events
+
+    p = _periods(13)
+    ev = refit_events(periods_to_dict(p))
+    assert len(ev) == len(p.block_fits) == 6  # 4 training + 1 validation + 1 test
+    assert list(ev["label"][:2]) == ["training 1/4", "training 2/4"] and list(ev["block"][-2:]) == ["validation", "test"]
+    assert all(ev["date"] - ev["data_through"] == pd.Timedelta(weeks=p.gap_weeks + 1))
+    assert refit_events({}).empty  # records saved before refits
+
+
+def test_block_scores_count_only_targets_inside_the_block():
+    """A validation week's h2 target can fall in the test block; the block's scores leave it out."""
+    import numpy as np
+
+    from src.forecasting.forecaster import evaluate_measures
+    from src.forecasting.measures import Measure
+    from src.forecasting.pipeline import _within_block
+
+    weeks = pd.date_range("2024-02-19", periods=8, freq="W-MON")  # a validation block
+    rows = pd.DataFrame({"date": weeks, "target_h0": 10.0, "target_h2": 10.0, "q83_h2": 12.0})
+    rows.loc[rows.index[-2:], "target_h2"] = 99.0  # sales in the first two test weeks
+    scored = _within_block(rows, weeks[-1], [0, 2])
+    assert scored["target_h2"].isna().sum() == 2 and scored["target_h0"].notna().all()
+    assert np.isclose(rows["target_h2"].iloc[-1], 99.0)  # the input is left alone
+    q83 = Measure("quantile", 2, 5 / 6)
+    assert evaluate_measures(rows, [q83])["coverage_q83_h2"] == 0.75  # before: test weeks counted
+    assert evaluate_measures(scored, [q83])["coverage_q83_h2"] == 1.0

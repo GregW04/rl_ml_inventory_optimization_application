@@ -22,6 +22,9 @@ class BlockFit:
 
     The fit uses rows up to ``fit_end``; their labels reach ``gap`` weeks further, so the
     newest label lands the week before ``start``. ``index`` counts fits within the block.
+    ``trigger`` says why it was made: ``start`` (the block's first fit), ``schedule`` (the fit
+    reached ``refit_every_weeks``) or ``drift`` (an alert, with the alerting ``classes``);
+    ``retuned`` marks a fit made with hyperparameters adopted by a retune just before it.
     """
 
     block: str
@@ -29,6 +32,9 @@ class BlockFit:
     start: pd.Timestamp
     end: pd.Timestamp
     fit_end: pd.Timestamp
+    trigger: str = "schedule"
+    classes: str = ""
+    retuned: bool = False
 
     @property
     def weeks(self) -> int:
@@ -42,6 +48,9 @@ class BlockFit:
             "end": str(self.end.date()),
             "fit_end": str(self.fit_end.date()),
             "weeks": self.weeks,
+            "trigger": self.trigger,
+            "classes": self.classes,
+            "retuned": self.retuned,
         }
 
 
@@ -276,7 +285,8 @@ def resolve_periods(config: dict, weeks: np.ndarray | None = None) -> Periods:
         out: list[BlockFit] = []
         for s_i in range(start_i, end_i + 1, step):
             e_i = min(s_i + step - 1, end_i)
-            out.append(BlockFit(block, len(out) + 1, ts(s_i), ts(e_i), ts(max(0, s_i - gap - 1))))
+            out.append(BlockFit(block, len(out) + 1, ts(s_i), ts(e_i), ts(max(0, s_i - gap - 1)),
+                                "start" if not out else "schedule"))
         return out
 
     block_fits = (
@@ -368,6 +378,26 @@ def block_fit_counts(resolved: dict) -> dict[str, int]:
     fits = resolved.get("block_fits") or []
     counts = {b: sum(1 for f in fits if f.get("block") == b) for b in BLOCK_NAMES}
     return {b: (n or 1) for b, n in counts.items()}
+
+
+def refit_events(resolved: dict) -> pd.DataFrame:
+    """
+    When the forecaster is (re)fitted for the RL blocks: one row per block fit with the first week
+    it forecasts, its block, its label and the last week of data it saw. Records without fits: none.
+    """
+    fits = resolved.get("block_fits") or []
+    rows = [{
+        "date": pd.Timestamp(f["start"]),
+        "block": BLOCK_NAMES.get(f["block"], f["block"]),
+        "label": fit_lane(f["block"], int(f.get("index", 1)), sum(g.get("block") == f["block"] for g in fits))
+        .removeprefix("Fit · "),
+        "data_through": pd.Timestamp(f["fit_end"]) if f.get("fit_end") else pd.NaT,
+        # Records saved before triggers existed: the first fit of a block started it, the rest were scheduled.
+        "trigger": f.get("trigger") or ("start" if int(f.get("index", 1)) == 1 else "schedule"),
+        "classes": f.get("classes") or "",
+        "retuned": bool(f.get("retuned", False)),
+    } for f in fits]
+    return pd.DataFrame(rows, columns=["date", "block", "label", "data_through", "trigger", "classes", "retuned"])
 
 
 def decision_ages(periods: Periods, window_weeks: int = 8, n_rounds: int = 6) -> pd.DataFrame:
@@ -593,4 +623,10 @@ def current_setup_hash(config: dict) -> str:
             for k in ("sales_file", "initial_state_date")
         },
     }
+    monitoring = config.get("monitoring") or {}
+    if monitoring.get("drift_refits"):
+        # Alert-driven refits change the forecasts, so they belong to the setup; alerts alone don't.
+        hash_payload["drift_refits"] = {
+            k: monitoring.get(k) for k in ("retune_on_return", "retune_min_gain_pct", "max_retunes")
+        }
     return config_hash(hash_payload)

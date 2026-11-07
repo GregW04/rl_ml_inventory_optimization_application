@@ -71,13 +71,39 @@ else:
         })
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
+st.subheader("Production loop")
+live = lib.ops_live_result()
+if live is None:
+    st.write("— the live VN2 run hasn't been scored yet (`python -m src.ops.cli score --env live`) —")
+else:
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Live system, € / SKU-window", f"{live['live_eur_per_sku']:.3f}",
+              help=f"{live['live_vn2_score_eur']:.1f} € over the official window, weeks {live['scored_weeks']}")
+    c2.metric("Anchor on the same weeks", f"{live['anchor_eur_per_sku']:.3f}",
+              help=f"{live['anchor_vn2_score_eur']:.1f} €: the anchor policy as an exact shadow from the same start")
+    c3.metric("Live vs anchor", f"{live['live_vs_anchor_pct']:+.2f}%",
+              help=f"Paired over SKUs, 95% CI {live['ci_lo']:+.2f} … {live['ci_hi']:+.2f}%")
+    links = " · ".join(x for x in (
+        f"[MLflow run]({live['url']})" if live["url"] else "",
+        f"[Airflow DAG vn2_live]({live['airflow_url']})",
+    ) if x)
+    st.caption(
+        f"The nine real VN2 weeks run once through the weekly loop under the frozen rules "
+        f"(rules {live['rules_version']}, tag ops-rules-v1): the forecaster refits when it is 13 weeks old, "
+        "drift monitoring alerts but never refits, and an RL challenger is trained every 13 weeks and "
+        "promoted only if it passes validation."
+        + (" Scored more than once: the latest is post hoc." if live["post_hoc"] else " Scored once.")
+        + f" {links}"
+    )
+
 st.divider()
 st.markdown(
     "Use the pages in the sidebar:\n"
-    "1. **Run Forecasting** — set periods, refit cadence, features, measures and the ensemble, preview the folds, launch\n"
+    "1. **Run Forecasting** — set periods, the fixed refit schedule, drift alerts, features, measures and the ensemble, "
+    "preview the folds and refits, launch\n"
     "2. **Run RL** — pick a forecasting run, choose state and method, train, compare on validation, score test once\n"
     "3. **Experiments** — browse & compare MLflow runs\n"
-    "4. **Forecasts** — actual vs forecast per horizon, coverage, feature importance\n"
+    "4. **Forecasts** — actual vs forecast per horizon, coverage, drift alerts per demand class, feature importance\n"
     "5. **Inventory & RL** — training sample → validation for one or more configurations, where a policy wins and "
     "loses, and order recommendations with the reason"
 )

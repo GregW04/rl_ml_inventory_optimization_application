@@ -155,6 +155,26 @@ periods:
   # (0 = one fit per block). The test block keeps one fit made before its first week.
   refit_every_weeks: 13
 
+# Drift alerts on a forecasting run's fits: the production loop's bias alarm (thresholds from the
+# frozen configs/ops.yaml), per demand class, restarted at each refit. Alerts only: refits keep the
+# fixed schedule above. Outside `periods`/`forecasting`, so it doesn't change the setup hash.
+monitoring:
+  drift_alerts: true
+  # Act on the alerts: an alert in the RL train or validation block adds a forecaster refit from the next
+  # week, on top of `periods.refit_every_weeks` (the age rule stays as a backstop; 0 = refit only after
+  # alerts). The test block keeps its single fit. Decided while the run goes, so it changes the forecasts.
+  drift_refits: false
+  # If the same class alerts again after an alert-triggered refit, tune the hyperparameters again and adopt
+  # them only if they beat the current ones on the last `retune_holdout_weeks` weeks known that week, which
+  # the tuning never sees, by at least `retune_min_gain_pct` (primary measure). The tuning uses the run's own CV
+  # settings (`forecasting.validation` folds, the newest `forecasting.tuning.n_cv_folds` of them, all search
+  # settings of `forecasting.tuning`), counted back from the rows before the holdout; if those folds do not all
+  # fit there, the retune is skipped and says so. Needs `forecasting.tuning.enabled`; at most `max_retunes` per run.
+  retune_on_return: true
+  retune_holdout_weeks: 8
+  retune_min_gain_pct: 1.0
+  max_retunes: 1
+
 rl:
   # Seeds trained per configuration; project.seed must be among them (its weights ship).
   seeds: [42, 43, 44]

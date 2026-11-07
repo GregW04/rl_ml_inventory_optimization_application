@@ -15,9 +15,6 @@ PANELS: dict[str, tuple[str, list[float], str]] = {
     "policy_std": (
         "Exploration: policy std", [],
         "Should fall, then flatten. An early collapse stops exploration; no fall at all means no learning signal."),
-    "exploration_rate": (
-        "Exploration: ε (DQN)", [],
-        "Share of random actions; it follows DQN's schedule."),
     "approx_kl": (
         "Update size: KL old → new", [0.02],
         "How far one iteration moved the policy; usually below 0.02. Spikes mean steps are too big."),
@@ -44,8 +41,8 @@ PANELS: dict[str, tuple[str, list[float], str]] = {
         "GRPO: groups with identical costs", [],
         "Windows whose replays all cost the same teach nothing (often slow movers, where integer orders coincide)."),
 }
-# Logged once per PPO / GRPO iteration (step = iteration); the rest use training windows as the step.
-PER_ITERATION = frozenset(PANELS) - {"exploration_rate"}
+# Logged once per PPO / GRPO iteration (step = iteration); the learning curves use training windows as the step.
+PER_ITERATION = frozenset(PANELS)
 KEYS = (*LEARNING, *PANELS)
 # The split view's training and validation colours.
 BLOCKS = {"training sample": "#F58518", "validation": "#54A24B"}

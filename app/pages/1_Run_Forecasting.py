@@ -15,6 +15,7 @@ import pandas as pd
 import streamlit as st
 
 from app import lib
+from src.forecasting.drift_alerts import default_rules, earliest_alert_week
 from src.forecasting.features.calendar import EVENTS
 from src.forecasting.forecaster import MEAN_OBJECTIVES
 from src.forecasting.measures import (
@@ -34,6 +35,9 @@ from src.forecasting.periods import (
 )
 from src.simulation.vn2 import VN2Rules
 
+DRIFT_RULES = default_rules()  # the frozen production thresholds (configs/ops.yaml)
+EARLIEST_ALERT_WEEK = earliest_alert_week(DRIFT_RULES)
+
 st.set_page_config(page_title="Run Forecasting", page_icon="🚀", layout="wide")
 st.title("Run Forecasting")
 st.caption(
@@ -51,6 +55,11 @@ def _form_defaults(record: dict | None) -> dict:
     record = record or {}
     return {
         "periods": record.get("periods_input") or base_cfg.get("periods") or {},
+        "monitoring": {
+            "drift_alerts": bool((base_cfg.get("monitoring") or {}).get("drift_alerts", False)),
+            "drift_refits": bool((base_cfg.get("monitoring") or {}).get("drift_refits", False)),
+            "retune_on_return": bool((base_cfg.get("monitoring") or {}).get("retune_on_return", True)),
+        },
         "forecasting": {
             "measures": list(fc.get("measures") or []),
             "primary_measure": fc.get("primary_measure"),
@@ -107,9 +116,11 @@ def _preset_label(entry: dict) -> str | None:
 # rewritten each run, so values survive a visit to another page.
 # Rev 3 adds forecast measures and the backend choice. Rev 4 adds the demand-profile
 # features and the mean objective, and drops measure kinds no longer offered. Rev 5
-# replaces the refit-per-block switch with a refit cadence and adds the ensemble. An open
-# session still holding a previous form is moved onto the config.yaml defaults once.
-_FORM_REV = 5
+# replaces the refit-per-block switch with a refit cadence and adds the ensemble. Rev 6 adds
+# the drift-alert toggle. Rev 7 splits it into drift monitoring and drift-triggered refits and adds
+# the retune option. An open session still holding a previous form is moved onto the config.yaml
+# defaults once.
+_FORM_REV = 7
 if "fc_form" not in st.session_state or st.session_state.get("fc_form_rev") != _FORM_REV:
     migrating = "fc_form" in st.session_state
     st.session_state.fc_form = _form_defaults(None)
@@ -170,7 +181,7 @@ with left:
             "RL test weeks", 8, 40, int(pin.get("rl_test_weeks", 8)), key=k("rl_test_w")
         )
         refit_every = st.number_input(
-            "Refit the forecaster every n weeks (0 = once per block)",
+            "Refit the forecaster every n weeks, on a fixed schedule (0 = once per block)",
             0,
             52,
             int(pin.get("refit_every_weeks", 13) or 0),
@@ -178,10 +189,61 @@ with left:
             help=(
                 "Applies inside the RL training and validation blocks. Each fit only uses "
                 "labels from before the weeks it forecasts, so shorter cadences keep the "
-                "training forecasts as fresh as the ones the agent is judged on."
+                "training forecasts as fresh as the ones the agent is judged on. Production "
+                "uses the same rule: refit when the model is 13 weeks old (ops-rules-v1)."
             ),
         )
         st.caption("The test block always keeps one fit made before its first week (VN2 rule).")
+        mon = form.get("monitoring", {})
+        refit_default = bool(mon.get("drift_refits", False))
+        refit_on = bool(st.session_state.get(k("drift_refits"), refit_default))  # drift refits need the alerts
+        monitor_on = st.toggle(
+            "Drift monitoring (alerts)",
+            value=True if refit_on else bool(mon.get("drift_alerts", False)),
+            disabled=refit_on,
+            key=k("drift_alerts_needed") if refit_on else k("drift_alerts"),
+            help=(
+                "Logs the production bias alarm for every fit: per demand class, Trigg's tracking signal of the "
+                f"weekly forecast error, restarted at each refit, alert when it stays past ±{DRIFT_RULES.bias.limit} "
+                f"for {DRIFT_RULES.bias.persistence_weeks} weeks. Shown on the Forecasts page. Alerts alone never "
+                "refit. Always on while drift-triggered refits is on."
+            ),
+        )
+        refit_on = st.toggle(
+            "Drift-triggered refits",
+            value=refit_default,
+            key=k("drift_refits"),
+            help=(
+                "An alert in the training or validation block adds a refit from the next week, on top of the "
+                "schedule above (set the schedule to 0 to refit only after alerts). The test block keeps its single "
+                "fit. The extra fits are decided while the run goes, so the preview shows only the schedule, and "
+                "each costs as much as a scheduled one."
+            ),
+        )
+        tuning_on = bool(st.session_state.get(k("tuning"), fc_form["tuning"]["enabled"]))
+        retune_on = bool(mon.get("retune_on_return", True))
+        if refit_on:
+            retune_on = st.checkbox(
+                "Retune if the same class alerts again after a refit",
+                value=retune_on,
+                disabled=not tuning_on,
+                key=k("retune_on_return"),
+                help=(
+                    "If an alert returns for a class that triggered the previous alert-driven refit, tune the "
+                    "hyperparameters again (with the folds of \"Forecast cross-validation\" below, on the rows before "
+                    "the last 8 weeks known that week) and use them only if they beat the current ones on those 8 "
+                    "weeks, which the tuning never sees (primary measure, at least 1% better). If the folds do not all "
+                    "fit before those 8 weeks, the retune is skipped. At most once per run. Tuning takes tens of "
+                    "minutes to hours."
+                ),
+            )
+            if not tuning_on:
+                st.caption("Retuning needs hyperparameter tuning (Model tab).")
+        if (monitor_on or refit_on) and 0 < int(refit_every) < EARLIEST_ALERT_WEEK:
+            st.warning(
+                f"Refits every {int(refit_every)} weeks end each fit before an alert can fire "
+                f"(the earliest is a fit's week {EARLIEST_ALERT_WEEK})."
+            )
         with st.expander("Forecast cross-validation"):
             val_cfg = fc_form["validation"]
             n_folds = st.number_input(
@@ -427,6 +489,8 @@ with left:
         )
 
 overrides = {
+    "monitoring": {"drift_alerts": bool(monitor_on or refit_on), "drift_refits": bool(refit_on),
+                   "retune_on_return": bool(retune_on)},
     "periods": {
         "data_start": data_start,
         "end": data_end,
@@ -505,6 +569,11 @@ with right:
     if not periods.errors:
         lib.render_refit_preview(periods, n_members=N_MEMBERS)
     lib.render_split_view(timeline(periods), periods_to_dict(periods))
+    if not periods.errors and periods.block_fits:
+        st.caption(
+            ("**Scheduled refits** (alerts add more while the run goes): " if refit_on else "**Refits:** ")
+            + lib.refit_schedule(periods_to_dict(periods))
+        )
     if not periods.errors:
         chart = lib.age_chart(periods)
         if chart is not None:

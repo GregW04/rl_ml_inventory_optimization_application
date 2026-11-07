@@ -146,28 +146,49 @@ orders = policy.predict(decision_frame)   # src.ops.rl.decision_frame(state, for
   `demand_profile`, CV settings, `n_features`, `n_skus`, `n_weeks`,
   the RL block dates, `refit_every_weeks`, `n_block_fits`, `ensemble`, `ensemble_members`,
   `champion_model` (`ensemble` when it is on) and tuned `best_*` params (`best_{member}_*` per
-  ensemble member).
+  ensemble member). With drift monitoring on, also `drift_rule` and `drift_level_measure`.
 - **Metrics**: per measure and CV mean `cv_{metric}_{id}`. Quantiles log `pinball` and
   `coverage`, means log `rmse`, `mae` and `bias`. `cv_primary` is the
   primary metric. Per-fold step metrics use the same names. Out-of-sample scores per RL block
   are `oos_{rl_train,rl_val,rl_test}_{metric}_{id}`. The app hides `oos_rl_test_*` until the run's test
   block has been scored. Also logged: `calibration_shift_{id}` when calibration is on, plus model-selection
-  and tuning scores.
+  and tuning scores. With drift monitoring on: `drift_alert_weeks_{rl_train,rl_val}`, the weeks in which at
+  least one demand class alerted (no test-block count). With drift-triggered refits on: `n_block_fits_actual`,
+  `n_drift_refits`, `n_retunes` (challenges run, skipped ones not counted) and `n_retunes_adopted`.
+  - **Block-end rule (runs tagged `scores_within_block=true`):** a block's scores count only targets inside
+    the block. Earlier runs scored the last one or two validation weeks of their h1/h2 measures on test-week
+    sales (25% of the h2 validation targets with an 8-week block); their numbers are left as logged.
 - **Artifacts**:
   - `feature_importance/feature_importance.{csv,png}` (the primary measure's booster);
   - `cv_charts/cv_<metric>_per_fold.png`, `cv_charts/oof_sample.png`, `cv_detail/fold_metrics.csv`;
   - `cv_by_entity/cv_by_entity.csv`;
   - `forecaster.joblib` (the test-block fit), `cv_metrics.json`, `warnings.json` (period warnings, if any);
   - `forecasts/`, which contains:
-    - `forecast_setup.json`: periods (including `refit_every_weeks` and `block_fits`), timeline, and the measure manifest (`schema: 2`, `measures`, `primary_measure`, `calibration`);
+    - `forecast_setup.json`: periods (including `refit_every_weeks` and `block_fits`: the fits actually made, each with
+      its `trigger`, `start` for the block's first fit, `schedule` for the age rule or `drift` for an alert, the
+      alerting `classes` and `retuned`), timeline, and the measure manifest (`schema: 2`, `measures`,
+      `primary_measure`, `calibration`);
     - `train_forecasts.parquet`: out-of-sample forecasts for the RL blocks, one column per measure id, plus `fit_end` (the last data week of the fit that wrote the row);
-    - `oof_forecasts.parquet`.
+    - `oof_forecasts.parquet`;
+    - `retunes.json` (drift-triggered refits on): the retune challenges the run made (alert week, block, alerting
+      classes, holdout scores of the current and the new settings, gain %, adopted), with the CV settings they
+      tuned with (`folds` × `fold_weeks`), the last row the tuning saw (`tuned_to`) and the holdout (`holdout_start`,
+      `holdout_end`); `skipped` and a `note` when the run's CV folds did not all fit before the holdout (no tuning);
+      `[]` when none;
+    - `drift_alerts.parquet` (drift monitoring on): one row per fit × week × demand class with the weekly
+      error, the tracking signal, the weeks in a row past the limit, `alert` and `severe`. It is the
+      production loop's bias alarm (thresholds from `configs/ops.yaml`), restarted at each refit, with no
+      cost-share filter. Every block is in the file; the app hides the test block until it has been scored.
+      Alerts never refit: refits follow `refit_every_weeks`.
 
   RL reads `forecasts/` of the run it is given.
 
   Runs made before 2026-11-02 have random `tmpXXXX` file names in the chart and table folders.
 - **Tags**:
-  - `config_hash`: a hash of the forecasting config, used by the duplicate-run guard;
+  - `config_hash`: a hash of the forecasting config, used by the duplicate-run guard. The
+    `monitoring.drift_alerts` switch is outside the hashed sections: it changes no forecast. Drift-triggered
+    refits do change the forecasts, so `monitoring.drift_refits` and its options join the hash when it is on;
+  - `drift_monitoring`, `drift_refits` (`true` or `false`) and `scores_within_block` (see Metrics);
   - the provenance tags above;
   - `legacy_test_evaluations` on the three runs whose test block was evaluated before the test lock
     existed (see Legacy runs).

@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 from src.forecasting.calibration import fit_quantile_shifts
+from src.forecasting.drift_refits import Retune, WalkState, walk_block
 from src.forecasting.entity_metrics import log_cv_entity_metrics
 from src.forecasting.forecaster import (
     ENSEMBLE,
@@ -35,8 +36,11 @@ from src.forecasting.measures import (
 )
 from src.forecasting.model import build_feature_matrix, get_feature_columns
 from src.forecasting.periods import (
+    MAX_BLOCK_FITS_WARNING,
+    BlockFit,
     build_setup_record,
     current_setup_hash,
+    periods_to_dict,
     resolve_periods,
     save_setup,
 )
@@ -236,6 +240,101 @@ def _choose_model(
     return name, None
 
 
+def _within_block(scored: pd.DataFrame, block_end: pd.Timestamp, horizons: list[int]) -> pd.DataFrame:
+    """A copy whose ``target_h{h}`` is NaN where week + h falls after the block's last week."""
+    out = scored.copy()
+    for h in horizons:
+        col = f"target_h{h}"
+        if col in out.columns:
+            out.loc[out["date"] + pd.Timedelta(weeks=h) > block_end, col] = np.nan
+    return out
+
+
+def _log_drift_alerts(config: dict, panel: pd.DataFrame, forecasts: pd.DataFrame, periods,
+                      measures: list[Measure], forecasts_dir: Path) -> None:
+    """The production bias alarm on the run's fits: an artifact, alert weeks per block, never an action."""
+    from src.forecasting import drift_alerts
+    from src.forecasting.drift import h0_level_measure
+
+    level = h0_level_measure(measures)
+    rules = drift_alerts.default_rules()
+    if level is None or forecasts.empty:
+        mlflow.set_tag("drift_monitoring", "false")
+        return
+    alerts = drift_alerts.fit_alerts(forecasts, drift_alerts.class_actuals(panel, config),
+                                     periods_to_dict(periods), level.id, rules)
+    alerts.to_parquet(forecasts_dir / "drift_alerts.parquet", index=False)
+    mlflow.set_tag("drift_monitoring", "true")
+    mlflow.log_params({"drift_rule": drift_alerts.describe(rules), "drift_level_measure": level.id})
+    # The test block's count is left out of the metrics, like every test number before scoring.
+    for block in ("rl_train", "rl_val"):
+        mlflow.log_metric(f"drift_alert_weeks_{block}", drift_alerts.alert_weeks(alerts, block))
+
+
+def _tune_all(df: pd.DataFrame, config: dict, model_name: str) -> dict | None:
+    """Tune again on ``df``: the single backend's parameters, or each ensemble member's."""
+    from src.forecasting.tuning import tune_model
+
+    if model_name == ENSEMBLE:
+        _, members = ensemble_settings(config)
+        return {m: tune_model(m, df, config)["best_params"] for m in members}
+    return tune_model(model_name, df, config)["best_params"]
+
+
+def _retune_challenge(df, config, model_name, measures, primary, feature_cols, calibration, gap_weeks):
+    """
+    The retune step of a drift refit. The last ``monitoring.retune_holdout_weeks`` weeks known that week are a
+    holdout; the rows before them (with the label gap) are the training rows. Tuning runs on the training rows
+    only, with the run's own CV settings (``tuning_folds``, counted back from where those rows end), so the
+    holdout stays unseen by the tuning. If the run's folds do not all fit in those rows the retune is skipped and
+    says so, instead of tuning on fewer folds. Then the current and the new settings are fitted on the training
+    rows and compared on the holdout by the primary measure. The new settings are adopted only if they are at
+    least ``retune_min_gain_pct`` better.
+    """
+    from src.forecasting.tuning import expected_tuning_folds, tuning_folds
+
+    mon = config.get("monitoring") or {}
+    min_gain = float(mon.get("retune_min_gain_pct", 1.0))
+    holdout_weeks = max(int(mon.get("retune_holdout_weeks", 8)), 1)
+    metric = primary_metric_name(primary)
+    week = pd.Timedelta(weeks=1)
+
+    def retune(alert_week, fit_end, classes, params):
+        val_start = fit_end - (holdout_weeks - 1) * week
+        train = df[df["date"] <= val_start - (gap_weeks + 1) * week]
+        val = df[(df["date"] >= val_start) & (df["date"] <= fit_end)]
+        shown_classes = ",".join(classes)
+        try:
+            folds = tuning_folds(train, config) if len(train) else []
+        except RuntimeError:  # not even one fold fits
+            folds = []
+        rows = dict(
+            tuned_to=str(train["date"].max().date()) if len(train) else "", holdout_start=str(val_start.date()),
+            holdout_end=str(fit_end.date()), folds=len(folds), fold_weeks=len(folds[-1].val_dates) if folds else 0)
+        wanted = expected_tuning_folds(config)
+        if len(folds) < wanted:
+            note = f"only {len(folds)} of the run's {wanted} CV folds fit in the rows before the holdout"
+            print(f"[retune] {alert_week.date()} {shown_classes}: skipped, {note}", flush=True)
+            return Retune(alert_week, "", list(classes), None, None, None, False, **rows, skipped=True, note=note), params
+        new_params = _tune_all(train, config, model_name)
+        scores = {}
+        for name, p in (("current", params), ("new", new_params)):
+            forecaster = make_forecaster(config, model_name, p, [primary])
+            forecaster.fit(train, feature_cols=feature_cols)
+            forecaster.calibration = dict(calibration)
+            scores[name] = evaluate_measures(forecaster.predict(val, feature_cols=feature_cols), [primary]).get(metric)
+        cur, new = scores["current"], scores["new"]
+        gain = 100.0 * (cur - new) / cur if cur and np.isfinite(cur) and new is not None and np.isfinite(new) else float("nan")
+        outcome = Retune(alert_week, "", list(classes), cur, new, gain, bool(gain >= min_gain), **rows)
+        shown = [f"{v:.4f}" if v is not None and np.isfinite(v) else "n/a" for v in (cur, new)]
+        print(f"[retune] {alert_week.date()} {shown_classes}: {metric} {shown[0]} -> {shown[1]} ({gain:+.1f}%) on "
+              f"{rows['holdout_start']}..{rows['holdout_end']} after tuning on {len(folds)} folds to {rows['tuned_to']}, "
+              f"{'adopted' if outcome.adopted else 'kept the current settings'}", flush=True)
+        return outcome, (new_params if outcome.adopted else params)
+
+    return retune
+
+
 def _fit_rl_block_forecasts(
     df: pd.DataFrame,
     config: dict,
@@ -244,45 +343,79 @@ def _fit_rl_block_forecasts(
     model_name: str,
     model_params: dict | None,
     calibration: dict[str, float],
-) -> tuple[pd.DataFrame, dict[str, float], MeasureForecaster | EnsembleForecaster | None]:
+    panel: pd.DataFrame | None = None,
+    primary: Measure | None = None,
+) -> tuple[pd.DataFrame, dict[str, float], MeasureForecaster | EnsembleForecaster | None, list[BlockFit], list[Retune]]:
     """
     Out-of-sample forecasts for the RL blocks, one forecaster fit per ``periods.block_fits``.
 
     Each fit uses rows up to its ``fit_end`` and writes forecasts for its own weeks only.
     The training and validation blocks get a fresh fit every ``refit_every_weeks``; the
-    test block keeps one fit. Scores per block pool that block's fits.
+    test block keeps one fit. With ``monitoring.drift_refits`` the training and validation fits are
+    decided as the blocks are walked, so an alert adds a refit (src/forecasting/drift_refits.py);
+    the fits actually made, and the retunes, are returned. Scores per block pool that block's fits,
+    and count only targets inside the block: a validation week's h2 target can fall in the test block.
     """
     feature_cols = get_feature_columns(df)
+    horizons = sorted({m.horizon for m in measures})
     parts: dict[str, list[pd.DataFrame]] = {}
     last_forecaster = None
-    for fit in periods.block_fits:
-        pred_df = df[(df["date"] >= fit.start) & (df["date"] <= fit.end)]
-        if pred_df.empty:
-            continue
-        forecaster = make_forecaster(config, model_name, model_params, measures)
-        forecaster.fit(df[df["date"] <= fit.fit_end], feature_cols=feature_cols)
+
+    def fit_predict(fit_end, start, end, params):
+        nonlocal last_forecaster
+        print(f"[fit] data to {fit_end.date()}, forecasts from {start.date()}", flush=True)
+        forecaster = make_forecaster(config, model_name, params, measures)
+        forecaster.fit(df[df["date"] <= fit_end], feature_cols=feature_cols)
         forecaster.calibration = dict(calibration)
-        scored = forecaster.predict(pred_df, feature_cols=feature_cols)
-        scored["fit_end"] = fit.fit_end
-        parts.setdefault(fit.block, []).append(scored)
         last_forecaster = forecaster
-        print(
-            f"[block fit] {fit.block} {fit.index}: data to {fit.fit_end.date()}, "
-            f"forecasts {fit.start.date()}..{fit.end.date()}",
-            flush=True,
-        )
+        return forecaster.predict(df[(df["date"] >= start) & (df["date"] <= end)], feature_cols=feature_cols)
+
+    from src.forecasting import drift_alerts
+    from src.forecasting.drift import h0_level_measure
+
+    mon = config.get("monitoring") or {}
+    level = h0_level_measure(measures)
+    walk = bool(mon.get("drift_refits")) and panel is not None and level is not None and primary is not None
+    state = WalkState(params=model_params)
+    fits: list[BlockFit] = []
+    if walk:
+        actuals, rules = drift_alerts.class_actuals(panel, config), drift_alerts.default_rules()
+        tuning_on = bool(config["forecasting"].get("tuning", {}).get("enabled", False))
+        retune = (_retune_challenge(df, config, model_name, measures, primary, feature_cols, calibration, periods.gap_weeks)
+                  if mon.get("retune_on_return", True) and tuning_on else None)
+        for block in ("rl_train", "rl_val"):
+            static = [f for f in periods.block_fits if f.block == block]
+            if not static:
+                continue
+            block_fits, block_parts = walk_block(
+                block, static[0].start, static[-1].end, periods.gap_weeks, periods.refit_every_weeks, fit_predict,
+                lambda chunk: drift_alerts.first_alert(chunk, actuals, level.id, rules), state, retune,
+                int(mon.get("max_retunes", 1)), MAX_BLOCK_FITS_WARNING)
+            fits += block_fits
+            parts[block] = block_parts
+    for fit in periods.block_fits:
+        if walk and fit.block != "rl_test":
+            continue
+        scored = fit_predict(fit.fit_end, fit.start, fit.end, state.params)
+        if scored.empty:
+            continue
+        parts.setdefault(fit.block, []).append(scored.assign(fit_end=fit.fit_end))
+        fits.append(fit)
+    for f in fits:
+        print(f"[block fit] {f.block} {f.index}: data to {f.fit_end.date()}, forecasts {f.start.date()}..{f.end.date()} "
+              f"({f.trigger}{' ' + f.classes if f.classes else ''}{', retuned' if f.retuned else ''})", flush=True)
 
     block_metrics: dict[str, float] = {}
     for block, block_parts in parts.items():
-        scored = pd.concat(block_parts, ignore_index=True)
+        scored = _within_block(pd.concat(block_parts, ignore_index=True), getattr(periods, f"{block}_end"), horizons)
         for k, v in evaluate_measures(scored, measures).items():
             block_metrics[f"oos_{block}_{k}"] = v
 
     if not parts:
-        return pd.DataFrame(), block_metrics, last_forecaster
+        return pd.DataFrame(), block_metrics, last_forecaster, fits, state.retunes
     combined = pd.concat([p for block_parts in parts.values() for p in block_parts], ignore_index=True)
     combined = combined.drop_duplicates(subset=["store", "product", "date"], keep="last")
-    return combined, block_metrics, last_forecaster
+    return combined, block_metrics, last_forecaster, fits, state.retunes
 
 
 def run_pipeline(config_path: str | None = None, force: bool = False) -> dict:
@@ -311,9 +444,14 @@ def run_pipeline(config_path: str | None = None, force: bool = False) -> dict:
     val_cfg = config["forecasting"]["validation"]
     model_cfg = config["forecasting"]["model"]
     calibrate = bool(config["forecasting"].get("calibrate_quantiles", False))
+    monitoring = config.get("monitoring") or {}
 
     with mlflow.start_run(run_name="demand_forecast_pipeline") as run:
         mlflow.set_tag("config_hash", config_hash)
+        # Block scores count only targets inside their block (runs before this tag let the last
+        # validation weeks' h1/h2 targets reach into the test block).
+        mlflow.set_tag("scores_within_block", "true")
+        mlflow.set_tag("drift_refits", str(bool(monitoring.get("drift_refits", False))).lower())
         tracking.log_provenance(config)
         mlflow.log_params({
             "measures": ",".join(m.id for m in measures),
@@ -377,11 +515,19 @@ def run_pipeline(config_path: str | None = None, force: bool = False) -> dict:
                 mlflow.log_metric(f"calibration_shift_{k}", v)
 
         # --- Step 4: out-of-sample forecasts per RL block ---
-        full_scored, block_metrics, forecaster = _fit_rl_block_forecasts(
-            df, config, periods, measures, model_name, model_params, calibration
+        full_scored, block_metrics, forecaster, fits, retunes = _fit_rl_block_forecasts(
+            df, config, periods, measures, model_name, model_params, calibration, panel=panel, primary=primary
         )
+        periods.block_fits = fits  # what was fitted: the fixed schedule, plus any alert-driven refits
         for k, v in block_metrics.items():
             mlflow.log_metric(k, v)
+        if monitoring.get("drift_refits"):
+            mlflow.log_metrics({
+                "n_block_fits_actual": len(fits),
+                "n_drift_refits": sum(f.trigger == "drift" for f in fits),
+                "n_retunes": sum(not r.skipped for r in retunes),
+                "n_retunes_adopted": sum(r.adopted for r in retunes),
+            })
         if periods.warnings:
             mlflow.log_dict({"warnings": list(periods.warnings)}, "warnings.json")
         if forecaster is not None:
@@ -402,6 +548,13 @@ def run_pipeline(config_path: str | None = None, force: bool = False) -> dict:
         if not full_scored.empty:
             # ``fit_end`` records which fit wrote each row, so forecast age can be audited.
             full_scored[forecast_cols + ["fit_end"]].to_parquet(forecasts_dir / "train_forecasts.parquet", index=False)
+        if monitoring.get("drift_alerts", False) or monitoring.get("drift_refits", False):
+            _log_drift_alerts(config, panel, full_scored[forecast_cols] if not full_scored.empty else full_scored,
+                              periods, measures, forecasts_dir)
+        else:
+            mlflow.set_tag("drift_monitoring", "false")
+        if monitoring.get("drift_refits"):
+            (forecasts_dir / "retunes.json").write_text(json.dumps([r.to_dict() for r in retunes], indent=2), encoding="utf-8")
         record = build_setup_record(
             config, periods, run_id=run.info.run_id, extra=manifest_record(measures, primary, calibration)
         )

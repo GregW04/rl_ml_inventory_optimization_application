@@ -7,9 +7,9 @@ and a learned policy can pick that up as a fixed offset. These helpers make it v
 - :func:`fit_bias`: per forecaster fit (optionally per demand class), the forecast error of
   every mean measure, the coverage of every quantile measure, and total sales against the
   same weeks a year earlier.
-- :func:`weekly_bias`: the weekly forecast error of one measure across all SKUs, with
-  Trigg's smoothed tracking signal, which flags weeks where recent errors mostly point
-  the same way.
+- :func:`weekly_bias`: the weekly forecast error of one measure across all SKUs.
+- :func:`trigg_signal`: Trigg's smoothed tracking signal, which the drift alerts
+  (``src/forecasting/drift_alerts.py``, per demand class and fit) and the ops loop use.
 
 Forecast error (bias) is (actual − forecast) ÷ actual, so positive means the forecasts were
 too low. Only targets inside the forecast's own block count (a validation forecast never
@@ -31,7 +31,6 @@ from src.forecasting.periods import BLOCK_NAMES, fit_lane
 # error is flagged after about 6 weeks, half of one after about 12.
 TRIGG_ALPHA = 0.2
 TRIGG_LIMIT = 0.74
-TRIGG_WARMUP = 4
 _WEEK = pd.Timedelta(weeks=1)
 
 
@@ -57,6 +56,9 @@ def run_fits(resolved: dict, include_test: bool = False) -> list[dict]:
             "end": pd.Timestamp(f["end"]),
             "fit_end": pd.Timestamp(f["fit_end"]) if f.get("fit_end") else pd.NaT,
             "block_end": pd.Timestamp(resolved.get(f"{block}_end") or f["end"]),
+            # Records saved before triggers existed: the first fit of a block started it, the rest were scheduled.
+            "trigger": f.get("trigger") or ("start" if int(f.get("index", 1)) == 1 else "schedule"),
+            "classes": f.get("classes") or "",
         })
     return out
 
@@ -154,6 +156,7 @@ def fit_bias(
                 "fit": f["label"],
                 "data through": f["fit_end"].date() if pd.notna(f["fit_end"]) else None,
                 "forecast weeks": f"{f['start']:%Y-%m-%d} – {f['end']:%Y-%m-%d}",
+                "refit trigger": f["trigger"] + (f" ({f['classes']})" if f["classes"] else ""),
             }
             if classes is not None:
                 rec["demand class"] = key[1]
@@ -208,14 +211,8 @@ def weekly_bias(
     measure: Measure,
     include_test: bool = False,
 ) -> pd.DataFrame:
-    """
-    Weekly forecast error (%) of ``measure`` summed over all SKUs, Trigg's tracking signal
-    and an alarm flag (|signal| above :data:`TRIGG_LIMIT` after a short warm-up).
-
-    Week ``t``'s value uses errors up to week ``t`` only, so an alarm marks the week it
-    would have fired.
-    """
-    cols = ["date", "block", "fit", "bias_pct", "tracking_signal", "alarm"]
+    """Weekly forecast error (%) of ``measure`` summed over all SKUs, with its block and fit."""
+    cols = ["date", "block", "fit", "bias_pct"]
     rows = scored_rows(forecasts, sales, resolved, [measure], include_test)
     if rows.empty or measure.id not in rows.columns:
         return pd.DataFrame(columns=cols)
@@ -228,7 +225,5 @@ def weekly_bias(
         .sort_values("date")
     )
     g["bias_pct"] = 100.0 * g["err"] / g["act"].where(g["act"] > 0)
-    g["tracking_signal"] = trigg_signal(g["bias_pct"].fillna(0.0).to_numpy())
-    g["alarm"] = (g["tracking_signal"].abs() > TRIGG_LIMIT) & (np.arange(len(g)) >= TRIGG_WARMUP)
     g["block"] = g["block"].map(lambda b: BLOCK_NAMES.get(b, b))
     return g[cols].reset_index(drop=True)

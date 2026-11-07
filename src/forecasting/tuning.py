@@ -92,6 +92,25 @@ def _build_objective(
     return objective
 
 
+def expected_tuning_folds(config: dict) -> int:
+    """How many CV folds a tuning run is meant to score: the run's folds, capped by ``tuning.n_cv_folds``."""
+    val_cfg = config["forecasting"]["validation"]
+    return min(int(val_cfg["n_folds"]), int(config.get("forecasting", {}).get("tuning", {}).get("n_cv_folds", 1)))
+
+
+def tuning_folds(df: pd.DataFrame, config: dict) -> list:
+    """
+    The CV folds a tuning run on ``df`` is scored on: the run's own folds (``forecasting.validation``: count,
+    size, minimum training weeks), counted back from ``df``'s last week, and the newest
+    ``forecasting.tuning.n_cv_folds`` of them. The first tuning and every retune use this one definition.
+    """
+    n_tune = config.get("forecasting", {}).get("tuning", {}).get("n_cv_folds", 1)
+    folds = make_folds(get_unique_dates(df), config)
+    if not folds:
+        raise RuntimeError("No CV folds generated; cannot run hyperparameter tuning.")
+    return folds[-n_tune:]
+
+
 def tune_model(
     model_name: str,
     df: pd.DataFrame,
@@ -113,12 +132,7 @@ def tune_model(
     n_trials_no_improve = tune_cfg.get("n_trials_no_improve")
     early_stopping_min_delta = tune_cfg.get("early_stopping_min_delta", 0.0001)
 
-    dates = get_unique_dates(df)
-    folds = make_folds(dates, config)
-    if not folds:
-        raise RuntimeError("No CV folds generated; cannot run hyperparameter tuning.")
-
-    tune_folds = folds[-n_cv_folds_tune:]
+    tune_folds = tuning_folds(df, config)
     feature_cols = get_feature_columns(df)
 
     fold_splits = [

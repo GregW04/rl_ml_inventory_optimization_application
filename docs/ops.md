@@ -346,6 +346,81 @@ identical demand, so their costs pair on the same in-stock SKU-weeks. The CI is 
   - **The live run shows none, and couldn't.** The signal counts from a champion's 4th week and needs 2 weeks
     past the limit. The first live forecaster was replaced after 4 weeks and the second had 4 by the end. The
     closest value was Intermittent −0.72 on 2024-05-06, against the limit 0.74.
+  - **Research runs use the same detector.** A forecasting run with `monitoring.drift_alerts` on logs it per
+    fit (`forecasts/drift_alerts.parquet`, see `docs/mlflow.md`), without the cost-share filter, and the
+    Forecasts page shows it per demand class.
+
+**Other drift detectors, at the same false-alarm rate** (2026-11-07). The production alarm was compared with
+streaming drift detectors, on the weekly relative error per demand class of the never-refit replay.
+
+- **Method.** Each detector runs per class, restarts when any class alarms (a refit) and may alarm from the
+  4th week after a restart. Its threshold is set so that, on the production null paths (the replay's errors with
+  the slow drift removed, resampled in 4-week blocks, 200 paths of 78 weeks), it makes about 0.9 false refits
+  per 26 weeks. The harness reproduces the production 0.89 for Trigg 0.74/2 exactly. Power is the share of
+  injected persistent shifts (one class, from week 12, in units σ of that class's weekly error: Erratic 0.45,
+  Intermittent 0.18, Lumpy 0.27, Smooth 0.21) detected within 13 weeks.
+- **Result.**
+
+  | Detector | false refits / 26 weeks | 0.5σ | 1σ | 2σ |
+  |---|---|---|---|---|
+  | **Trigg, production** (0.74, 2 weeks) | 0.89 | **54%** | **93%** | 100% |
+  | CUSUM (k 0.5, h 5.25) | 0.93 | 29% | 77% | 99% |
+  | CUSUM, winsorized at ±3 (h 4.5) | 0.82 | 33% | 85% | 100% |
+  | Page-Hinkley (δ 0.5, λ 5.0) | 0.88 | 17% | 30% | 50% |
+  | Page-Hinkley, winsorized (λ 4.0) | 0.81 | 21% | 39% | 62% |
+  | ADWIN (any δ ≤ 1; permissive variant) | 0.00 (0.01) | 0% | 0% (2%) | 1% (7%) |
+
+- **On the real errors** (detector restarted at the start of the window), the first alarm for the autumn-2023
+  Intermittent decline was 2023-10-02 for Trigg (week 5, the earliest possible), 2023-09-25 and 2023-10-09 for
+  CUSUM (plain, winsorized), 2023-12-18 and 2023-12-25 for Page-Hinkley, and never for ADWIN. In the 2023
+  growth, CUSUM and Page-Hinkley flagged Erratic 2–3 weeks before Trigg (2023-03-06 and 03-13 against 03-27)
+  and missed Intermittent and Lumpy, which Trigg flagged (2023-04-03, 2023-06-05). Over the 78 weeks Trigg alarmed
+  7 times, CUSUM 4 to 8, Page-Hinkley 4 to 6 and ADWIN once, against about 2.7 expected from false alarms alone.
+- **MSTL level** (the nearest open equivalent of the MIST + DTW talk, PyData Amsterdam 2024; no MIST code is
+  published). It is computed on class sales, not on errors, so it has no false-alarm calibration here. The
+  seasonally adjusted 13-week level change of Intermittent was still +2.9% to +6.4% until 2023-11-06 and first
+  reached −5% on 2023-11-27, about six weeks after the Trigg alarm in the replay (2023-10-16); Lumpy crossed −5%
+  once (2023-11-06) and was back at +2.5% two weeks later.
+- **Why Trigg wins here.** Its signal is bounded between −1 and +1, so one holiday week can't push it over the
+  limit. CUSUM and Page-Hinkley accumulate raw scaled errors, so they need higher thresholds for the same
+  false-alarm rate, which costs sensitivity (winsorizing helps CUSUM, not enough). ADWIN needs long streams: its
+  bound can't be met by 78 weekly points.
+- **Caveats.** One replay, synthetic shifts, textbook versions written for the comparison (not library code),
+  and only the threshold tuned (CUSUM's k and Page-Hinkley's δ stayed at their standard values).
+
+**Drift-triggered refits and retuning in research runs** (the Run Forecasting toggles `monitoring.drift_refits`,
+`monitoring.retune_on_return`). Production keeps the fixed 13-week rule; research runs can act on the alerts.
+
+- **The rule.** The training and validation blocks are walked: a fit predicts to the end of the block and is cut
+  at the first alert (the production bias alarm, restarted at that fit), and the next fit starts the week after.
+  With `refit_every_weeks` set, the age rule stays as a backstop and restarts at every refit; with 0, only alerts
+  refit. These are the `drift_backstop` and `drift` strategies of the backtests. Without an alert the fits are
+  exactly the fixed schedule. The test block keeps its single fit (VN2 rule). Every fit still stops three weeks
+  before the first week it forecasts, and a forecast from before a cut is dropped, so nothing looks ahead.
+- **Retune if the alert returns** (the original plan's rule 6, only in these research runs). If an alert comes back
+  for a class that triggered the previous alert-driven refit, tuning runs again (`tune_model`, per member for the
+  ensemble) with the run's own CV settings. It is the same function and the same config as the first tuning
+  (`tuning_folds`): the folds are `forecasting.validation` (count, size, minimum training weeks), the newest
+  `forecasting.tuning.n_cv_folds` of them, scored by the primary measure, with the run's trial budget and early
+  stop. They are counted back from the end of the rows the tuning is given. Those rows stop 3 weeks (the label
+  gap) before the last `monitoring.retune_holdout_weeks` (8) weeks known that week. Those weeks are a holdout the
+  tuning never sees: the current and the new settings are both fitted on the rows before it and scored on it, and
+  the new settings are used only if they beat the current ones by `monitoring.retune_min_gain_pct` (1%) on the
+  primary measure. Tuning on a window that contained the holdout would favour the new settings, which were picked
+  on those very weeks. The price is that the tuning does not see the newest 11 weeks; the refit that follows still
+  fits on all the data. If the run's folds do not all fit in the rows before the holdout (a short history, large
+  folds), the retune is skipped and recorded with the reason, never run on fewer folds, and a skipped retune does not
+  use up `max_retunes`. At most `max_retunes` (1) per run, and only with hyperparameter tuning on. In the production
+  replay this never would have been needed: after each of the 9 drift refits, the class that had alarmed did not
+  alarm again before the next refit. The Forecasts page draws the run's folds, fits, alerts, refits and retunes on one
+  timeline ("Folds, alerts, refits and retunes"), with a lane per retune showing the rows its tuning saw and its holdout.
+- **Cost and limits.** An alert-driven fit costs as much as a scheduled one (the replay's drift rule refit about
+  every 9 weeks against every 13), and a retune costs the tuning time again (tens of minutes to hours). Alerts
+  stop adding fits once a block has 12. The preview before a run shows only the schedule.
+- **First real run** (CatBoost, no tuning, isolated store): the alerts cut the training block three times
+  (2023-10-16 Intermittent, 2023-12-11 Erratic, 2024-01-29 Intermittent) and the validation block once
+  (2024-03-18 Intermittent and Lumpy), so 7 fits instead of the scheduled 4. The test block kept its one fit
+  although an alert fired in it (2024-05-27).
 - **What was deleted.** After the comparison, the model files and registered models of `sim-never`, `sim-drift`
   and `sim-drift-backstop` were removed (24 models, 7.05 GB). Their runs, metrics and ledgers remain, and the
   models refit bit for bit from the recipe and the drops. `sim-fixed13` and `sim-final` keep theirs.

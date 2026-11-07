@@ -23,6 +23,7 @@ import tempfile
 import time
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 import yaml
@@ -40,6 +41,7 @@ ROOT = _find_root()
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 CONFIG_PATH = Path(os.environ.get("VN2_CONFIG") or ROOT / "configs" / "config.yaml")
+AIRFLOW_URL = os.environ.get("AIRFLOW_URL", "http://127.0.0.1:8080")
 
 from src.forecasting.measures import Measure, run_measures  # noqa: E402
 from src.forecasting.periods import (  # noqa: E402
@@ -50,6 +52,7 @@ from src.forecasting.periods import (  # noqa: E402
     load_run_setup,
     mean_decision_age,
     panel_weeks,
+    refit_events,
     resolve_periods,
 )
 from src.simulation.vn2 import check_vn2_compliance  # noqa: E402
@@ -215,6 +218,50 @@ def run_block_bias(run_id: str, include_test: bool) -> tuple[str | None, dict[st
     return level.id, blocks
 
 
+@st.cache_data(ttl=600, show_spinner="Classifying demand patterns…")
+def alert_actuals() -> pd.DataFrame:
+    """In-stock weekly sales with each SKU-week's demand class, as the drift alerts score them."""
+    from src.forecasting.drift_alerts import class_actuals
+
+    return class_actuals(sales_history(), get_config())
+
+
+@st.cache_data(ttl=60, show_spinner="Loading drift alerts…")
+def run_alerts(run_id: str, include_test: bool) -> tuple[pd.DataFrame, bool]:
+    """
+    (alerts, logged): the drift alerts the run logged, or, for runs that didn't log them, the same
+    detector computed now on the run's forecasts. The test block is dropped unless ``include_test``.
+    """
+    from src.forecasting import drift_alerts
+    from src.forecasting.drift import h0_level_measure
+
+    init_tracking()
+    path = fetch_run_file(get_config(), run_id, "drift_alerts.parquet")
+    if path is not None:
+        alerts, logged = pd.read_parquet(path), True
+    else:
+        record = run_setup(run_id)
+        fc_path = fetch_run_file(get_config(), run_id, "train_forecasts.parquet")
+        level = h0_level_measure(as_measures(measures_of_run(run_id)))
+        if record is None or fc_path is None or level is None:
+            return pd.DataFrame(), False
+        alerts = drift_alerts.fit_alerts(pd.read_parquet(fc_path), alert_actuals(), record.get("resolved", {}),
+                                         level.id, drift_alerts.default_rules())
+        logged = False
+    if not include_test:
+        alerts = alerts[alerts["block"] != "rl_test"]
+    return alerts.reset_index(drop=True), logged
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def run_retunes(run_id: str) -> pd.DataFrame:
+    """The retune challenges a run made (week, block, classes, holdout scores, adopted); empty when it made none."""
+    init_tracking()
+    path = fetch_run_file(get_config(), run_id, "retunes.json")
+    rows = json.loads(Path(path).read_text(encoding="utf-8")) if path is not None else []
+    return pd.DataFrame(rows)
+
+
 def forecast_run_label(r: pd.Series) -> str:
     """Start time, short id and the run's primary CV score."""
     started = r["start_time"].to_pydatetime().astimezone()
@@ -304,6 +351,34 @@ def rl_episodes(run_id: str, name: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Production loop (src/ops): the live VN2 run, read only
+# ---------------------------------------------------------------------------
+
+OPS_LIVE_EXPERIMENT = "vn2-ops-live"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def ops_live_result() -> dict | None:
+    """The live run's ops test (scored once): scores, CI, rules version and a link; None if it hasn't run."""
+    uri = init_tracking()
+    runs = tracking.search_runs(OPS_LIVE_EXPERIMENT, filter_string="tags.ops_test = 'true'")
+    if runs.empty:
+        return None
+    r = runs.iloc[0]
+    exps = tracking.list_experiments()
+    exp_id = exps.loc[exps["name"] == OPS_LIVE_EXPERIMENT, "experiment_id"].iloc[0]
+    out = {k: r.get(f"metrics.{k}") for k in ("live_vn2_score_eur", "anchor_vn2_score_eur", "live_eur_per_sku",
+                                               "anchor_eur_per_sku", "live_vs_anchor_pct", "ci_lo", "ci_hi")}
+    out.update({
+        "run_id": r["run_id"], "scored_weeks": r.get("tags.scored_weeks"), "rules_version": r.get("tags.rules_version"),
+        "post_hoc": r.get("tags.post_hoc") == "true", "n_scorings": len(runs),
+        "url": f"{uri.rstrip('/')}/#/experiments/{exp_id}/runs/{r['run_id']}" if uri.startswith("http") else None,
+        "airflow_url": f"{AIRFLOW_URL}/dags/vn2_live",
+    })
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Split view (live on the Forecasting page, frozen on RL / Experiments)
 # ---------------------------------------------------------------------------
 
@@ -317,6 +392,9 @@ _SEGMENT_COLORS = {
     "Fit": "#72B7B2",
     "Forecasts written": "#9ECAE9",
     "Validation": "#B279A2",
+    # The lane of a retune: the rows its tuning saw, and the holdout it never saw.
+    "Tuning rows": "#72B7B2",
+    "Holdout": "#B279A2",
     # Labels saved by runs before the rename.
     "Validation (checkpoint)": "#54A24B",
     "Test (final score)": "#E45756",
@@ -338,13 +416,132 @@ def _lane_key(lane: str) -> tuple:
         rest = lane[len("Fit · "):].split(" ")
         idx = int(rest[1].split("/")[0]) if len(rest) > 1 and rest[1].split("/")[0].isdigit() else 1
         return (3, _BLOCK_ORDER.get(rest[0], 9), idx, lane)
+    if lane.startswith("Retune · "):
+        return (3, 5, 0, lane)
     if lane == "RL":
         return (4, 0, 0, lane)
     return (5, 0, 0, lane)
 
 
-def timeline_chart(segments_df):
-    """Altair Gantt of period segments (lane × part)."""
+REFIT_KINDS = {"start": "block start", "schedule": "schedule", "drift": "alert"}
+REFIT_COLORS = {"start": "#8a8a8a", "schedule": "#4C78A8", "drift": "#E45756"}
+REFIT_EVENT = {"start": "refit: block start", "schedule": "refit: schedule", "drift": "refit: after alert"}
+# The vertical marks of a run's timeline, in drawing order (retunes under refits under alerts):
+# event -> (colour, dash pattern, line width).
+EVENT_STYLES = {
+    "retune: adopted": ("#7B3FB0", [1, 0], 6.0),
+    "retune: kept settings": ("#B39DDB", [1, 0], 6.0),
+    "retune: skipped": ("#BDBDBD", [1, 0], 6.0),
+    "refit: block start": ("#8a8a8a", [6, 3], 1.5),
+    "refit: schedule": ("#4C78A8", [6, 3], 1.5),
+    "refit: after alert": ("#E45756", [6, 3], 1.5),
+    "alert": ("#8B1A1A", [2, 3], 2.5),
+}
+WEEK = pd.Timedelta(weeks=1)
+
+
+def _is_true(value) -> bool:
+    """True for a real True; a missing cell (NaN, None) is not."""
+    return isinstance(value, bool | np.bool_) and bool(value)
+
+
+def _num(value, spec: str) -> str:
+    """A number formatted with ``spec``; 'n/a' for a missing one."""
+    return "n/a" if value is None or pd.isna(value) else format(value, spec)
+
+
+def _retune_rows(retunes: pd.DataFrame | None) -> list[dict]:
+    return [] if retunes is None or retunes.empty else retunes.to_dict("records")
+
+
+def event_marks(refits: pd.DataFrame | None = None, alerts: pd.DataFrame | None = None,
+                retunes: pd.DataFrame | None = None) -> pd.DataFrame:
+    """
+    The vertical marks of a run's timeline: ``date``, ``event`` (a key of ``EVENT_STYLES``) and a tooltip
+    ``detail``. ``alerts`` is ``drift_alerts.first_alert_marks``; a retune is drawn at the refit that
+    followed its alert, the week from which its settings (or the kept ones) forecast.
+    """
+    rows: list[dict] = []
+    if refits is not None and not refits.empty:
+        for r in refits.itertuples():
+            through = f", data through {r.data_through:%Y-%m-%d}" if pd.notna(r.data_through) else ""
+            rows.append({
+                "date": r.date, "event": REFIT_EVENT.get(r.trigger, f"refit: {r.trigger}"),
+                "detail": f"{r.block} fit {r.label}{through}" + (f"; alert: {r.classes}" if r.classes else "")
+                + ("; with retuned settings" if r.retuned else "")})
+    if alerts is not None and not alerts.empty:
+        rows += [{"date": a.week, "event": "alert", "detail": f"{a.classes} alerted in fit {a.fit}"} for a in alerts.itertuples()]
+    for r in _retune_rows(retunes):
+        week, classes = pd.Timestamp(r["week"]), ", ".join(r.get("classes") or [])
+        if _is_true(r.get("skipped")):
+            event, detail = "retune: skipped", f"alert {week:%Y-%m-%d} ({classes}): skipped, {r.get('note')}"
+        else:
+            adopted = _is_true(r.get("adopted"))
+            event = "retune: adopted" if adopted else "retune: kept settings"
+            detail = (f"alert {week:%Y-%m-%d} ({classes}): holdout score of the current settings "
+                      f"{_num(r.get('current_score'), '.3f')}, of the new {_num(r.get('new_score'), '.3f')} "
+                      f"({_num(r.get('gain_pct'), '+.1f')}%); "
+                      + ("new settings used" if adopted else "kept the current settings"))
+        rows.append({"date": week + WEEK, "event": event, "detail": detail})
+    if not rows:
+        return pd.DataFrame(columns=["date", "event", "detail"])
+    order = {k: i for i, k in enumerate(EVENT_STYLES)}
+    marks = pd.DataFrame(rows)
+    return marks.sort_values("event", key=lambda e: e.map(order), kind="stable").reset_index(drop=True)
+
+
+def retune_segments(retunes: pd.DataFrame | None, resolved: dict) -> pd.DataFrame:
+    """
+    Timeline rows for the retunes that tuned, one lane each, like a CV fold: the rows the tuning saw, the label
+    gap, and the holdout the tuning never saw. Runs saved before retunes recorded their rows give none.
+    """
+    rows = []
+    start = pd.Timestamp(resolved["data_start"]) if resolved.get("data_start") else None
+
+    def add(lane, part, a, b):
+        rows.append({"lane": lane, "part": part, "start": a, "end": b, "weeks": (b - a).days // 7 + 1})
+
+    for r in _retune_rows(retunes):
+        if _is_true(r.get("skipped")) or not r.get("tuned_to") or not r.get("holdout_start") or start is None:
+            continue
+        lane = f"Retune · {r['week']}"
+        tuned_to, h0, h1 = pd.Timestamp(r["tuned_to"]), pd.Timestamp(r["holdout_start"]), pd.Timestamp(r["holdout_end"])
+        add(lane, "Tuning rows", start, tuned_to)
+        if h0 - tuned_to > WEEK:
+            add(lane, "Label gap", tuned_to + WEEK, h0 - WEEK)
+        add(lane, "Holdout", h0, h1)
+    return pd.DataFrame(rows, columns=["lane", "part", "start", "end", "weeks"])
+
+
+def retune_table(retunes: pd.DataFrame) -> pd.DataFrame:
+    """The retunes of a run as a table: the CV settings used, the holdout, the scores and the outcome."""
+    rows = []
+    for r in _retune_rows(retunes):
+        folds, weeks = int(r.get("folds") or 0), int(r.get("fold_weeks") or 0)
+        skipped, adopted = _is_true(r.get("skipped")), _is_true(r.get("adopted"))
+        rows.append({
+            "Alert week": r["week"], "Block": BLOCK_NAMES.get(r.get("block"), r.get("block")),
+            "Alerting classes": ", ".join(r.get("classes") or []),
+            "CV folds tuned on": f"{folds} × {weeks} wk" if folds else "—",
+            "Tuned on rows to": r.get("tuned_to") or "—",
+            "Holdout": f"{r['holdout_start']} … {r['holdout_end']}" if r.get("holdout_start") else "—",
+            "Current settings": r.get("current_score"), "New settings": r.get("new_score"), "Gain %": r.get("gain_pct"),
+            "Outcome": f"skipped: {r.get('note')}" if skipped else ("new settings used" if adopted else "kept the current settings"),
+        })
+    return pd.DataFrame(rows)
+
+
+# Parts that mark a window that is scored or forecast (what a zoomed timeline starts from).
+_WINDOW_PARTS = ("Validation", "Holdout", "Forecasts written", "Train", "Validation (selection)", "Test (production)")
+
+
+def timeline_chart(segments_df, refits: pd.DataFrame | None = None, alerts: pd.DataFrame | None = None,
+                   retunes: pd.DataFrame | None = None, zoom: bool = False):
+    """
+    Altair Gantt of period segments (lane × part) with vertical lines at the forecaster refits and, for a
+    finished run, at its alerts and retunes (``event_marks``). ``zoom`` starts the axis four weeks before the
+    first scored or forecast window, so the long fit bars run off the left edge and the events get room.
+    """
     import altair as alt
 
     if segments_df is None or segments_df.empty:
@@ -355,19 +552,39 @@ def timeline_chart(segments_df):
     lanes = sorted(df["lane"].unique(), key=_lane_key)
     present = [p for p in _SEGMENT_COLORS if p in set(df["part"])]
     color_scale = alt.Scale(domain=present, range=[_SEGMENT_COLORS[p] for p in present])
+    windows = df[df["part"].isin(_WINDOW_PARTS)]
+    domain = [(windows["start"].min() - pd.Timedelta(weeks=4)).isoformat(), (df["end"].max() + WEEK).isoformat()] \
+        if zoom and not windows.empty else None
+    scale = alt.Scale(domain=domain) if domain else alt.Undefined
     chart = (
         alt.Chart(df)
-        .mark_bar()
+        .mark_bar(clip=domain is not None)
         .encode(
             y=alt.Y("lane:N", title="Lane", sort=lanes, axis=alt.Axis(labelOverlap=False)),
-            x=alt.X("start:T", title="Week start"),
+            x=alt.X("start:T", title="Week start", scale=scale),
             x2="end:T",
             color=alt.Color("part:N", title="Segment", scale=color_scale),
             tooltip=["lane", "part", "start", "end", "weeks"],
         )
-        .properties(height=max(260, 60 + 30 * len(lanes)), width="container")
     )
-    return chart
+    events = event_marks(refits, alerts, retunes)
+    if not events.empty:
+        kinds = [k for k in EVENT_STYLES if k in set(events["event"])]
+
+        def style(i: int):
+            return alt.Scale(domain=kinds, range=[EVENT_STYLES[k][i] for k in kinds])
+
+        rules = alt.Chart(events).mark_rule(clip=domain is not None).encode(
+            x=alt.X("date:T", scale=scale),
+            color=alt.Color("event:N", title="Event", scale=style(0)),
+            strokeDash=alt.StrokeDash("event:N", title="Event", scale=style(1)),
+            strokeWidth=alt.StrokeWidth("event:N", title="Event", scale=style(2)),
+            tooltip=[alt.Tooltip("event:N", title="Event"), alt.Tooltip("date:T", title="Week"),
+                     alt.Tooltip("detail:N", title="Detail")],
+        )
+        chart = alt.layer(chart, rules).resolve_scale(color="independent", strokeDash="independent",
+                                                      strokeWidth="independent")
+    return chart.properties(height=max(260, 60 + 30 * len(lanes)), width="container")
 
 
 def _weeks_between(start, end) -> int | None:
@@ -385,9 +602,12 @@ def _fit_ends(resolved: dict, block: str, fallback_key: str) -> str:
 
 def render_split_view(segments: pd.DataFrame, resolved: dict) -> None:
     """Timeline chart plus block table, from live periods or a saved setup record."""
-    chart = timeline_chart(segments)
+    refits = refit_events(resolved)
+    chart = timeline_chart(segments, refits)
     if chart is not None:
         st.altair_chart(chart, width="stretch")
+        if not refits.empty:
+            st.caption("Dashed lines: forecaster refits, by why they were made (hover for the data each fit saw).")
     counts = block_fit_counts(resolved)
     blocks = [
         ("Forecaster CV region", "forecaster_cv", None),
@@ -408,6 +628,15 @@ def render_split_view(segments: pd.DataFrame, resolved: dict) -> None:
         if resolved.get(f"{key}_start")
     ]
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+
+def refit_schedule(resolved: dict) -> str:
+    """The refit dates of a schedule, e.g. ``2023-08-21 (data through 2023-07-31) · …``."""
+    ev = refit_events(resolved)
+    return " · ".join(
+        f"{r.date:%Y-%m-%d} {r.label} (data through {r.data_through:%Y-%m-%d}"
+        + (f"; alert {r.classes}" if r.trigger == "drift" else "") + (", retuned" if r.retuned else "") + ")"
+        for r in ev.itertuples())
 
 
 def refit_summary(resolved: dict) -> str:
